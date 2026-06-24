@@ -1,12 +1,13 @@
 import sqlite3
 import json
 import os
+import sys
+sys.stdout = sys.stderr
+
 from flask import Flask, request, jsonify, render_template_string
 import ccxt
 import math
-import os
-import sys
-sys.stdout = sys.stderr
+
 app = Flask(__name__)
 
 FIXED_API_KEY    = os.environ.get('OKX_API_KEY', '733c2c4a-1929-4817-b79a-345cf9deab0a')
@@ -21,8 +22,6 @@ def init_db():
         CREATE TABLE IF NOT EXISTS active_positions (
             symbol TEXT PRIMARY KEY,
             side TEXT,
-            highest_price REAL,
-            lowest_price REAL,
             last_entry_price REAL,
             current_step INTEGER,
             current_contracts REAL DEFAULT 0
@@ -54,7 +53,10 @@ def get_setting(key, default):
     cursor.execute("SELECT value FROM settings WHERE key=?", (key,))
     row = cursor.fetchone()
     conn.close()
-    return row[0] if row else default
+    val = row[0] if row else None
+    if val is None or val == '':
+        return default
+    return val
 
 def get_stats():
     conn = sqlite3.connect('bot_settings.db')
@@ -134,22 +136,18 @@ def dashboard():
     </style></head>
     <body>
     <h3 style="text-align:center;color:#4caf50;">🤖 S-DCA KONTROL PANELİ</h3>
-
     <div class="stats">
       <div class="stat"><div class="val">{{total}}</div><div class="lbl">İşlem</div></div>
       <div class="stat"><div class="val">{{win_rate}}</div><div class="lbl">Kazanma</div></div>
-      <div class="stat"><div class="val">{{pnl}}</div><div class="lbl">Toplam PnL</div></div>
+      <div class="stat"><div class="val">{{pnl}}</div><div class="lbl">PnL</div></div>
     </div>
-
     <div class="card">
       <h2>1. OKX API DURUMU</h2>
       <span class="badge">{{api_status}}</span>
       <p style="color:#888;font-size:0.75rem;margin:8px 0 0;">
-        Render → Environment Variables:<br>
-        OKX_API_KEY / OKX_SECRET / OKX_PASS
+        Render → Environment: OKX_API_KEY / OKX_SECRET / OKX_PASS
       </p>
     </div>
-
     <form action="/save" method="POST">
     <div class="card">
       <h2>2. KADEMELİ BÜTÇE ($)</h2>
@@ -205,7 +203,6 @@ def webhook():
         print("❌ Eksik veri")
         return jsonify({"status": "error", "message": "Eksik veri"}), 200
 
-    # Sembol dönüşümü: BTCUSDT.P → BTC/USDT:USDT
     symbol = raw_symbol.replace('.P', '').replace('-', '').replace('_', '').strip()
     if "USDT" in symbol and ":" not in symbol:
         symbol = symbol.replace("USDT", "/USDT:USDT")
@@ -232,36 +229,28 @@ def webhook():
     cursor.execute("SELECT side, last_entry_price, current_step FROM active_positions WHERE symbol=?", (symbol,))
     position = cursor.fetchone()
 
-    # -------------------------------------------------------
-    # ANA KURAL: Fiyat bazlı DCA filtresi
-    # LONG  → yeni fiyat, son girişten DÜŞÜK olmalı (daha kötüye gitmiş)
-    # SHORT → yeni fiyat, son girişten YÜKSEK olmalı (daha kötüye gitmiş)
-    # -------------------------------------------------------
     if position and step > 1:
         pos_side, last_entry_price, current_step = position
 
         if side == 'buy':
-            # LONG için: fiyat düşmemişse DCA yapma
             if current_price >= last_entry_price:
                 pct = (current_price - last_entry_price) / last_entry_price * 100
-                print(f"⛔ LONG DCA Engeli: Fiyat düşmedi. Şimdi:{current_price} >= Giriş:{last_entry_price} (+%{pct:.2f})")
+                print(f"⛔ LONG DCA Engeli: fiyat düşmedi (+%{pct:.2f})")
                 conn.close()
-                return jsonify({"status": "ignored", "message": f"LONG DCA engeli: fiyat yukarda (%+{pct:.2f})"}), 200
+                return jsonify({"status": "ignored", "message": f"LONG DCA engeli"}), 200
 
         elif side == 'sell':
-            # SHORT için: fiyat yükselmemişse DCA yapma
             if current_price <= last_entry_price:
                 pct = (last_entry_price - current_price) / last_entry_price * 100
-                print(f"⛔ SHORT DCA Engeli: Fiyat yükselmedi. Şimdi:{current_price} <= Giriş:{last_entry_price} (-%{pct:.2f})")
+                print(f"⛔ SHORT DCA Engeli: fiyat yükselmedi (-%{pct:.2f})")
                 conn.close()
-                return jsonify({"status": "ignored", "message": f"SHORT DCA engeli: fiyat asagida (%-{pct:.2f})"}), 200
+                return jsonify({"status": "ignored", "message": f"SHORT DCA engeli"}), 200
 
-        # Min mesafe filtresi (yeterince uzaklaşmış mı?)
         price_diff_pct = abs(current_price - last_entry_price) / last_entry_price * 100
         if price_diff_pct < min_distance_filter:
-            print(f"⛔ Mesafe Engeli: %{price_diff_pct:.2f} < Sınır %{min_distance_filter}")
+            print(f"⛔ Mesafe Engeli: %{price_diff_pct:.2f} < %{min_distance_filter}")
             conn.close()
-            return jsonify({"status": "ignored", "message": f"Mesafe engeli: %{price_diff_pct:.2f}"}), 200
+            return jsonify({"status": "ignored", "message": f"Mesafe engeli"}), 200
 
     try:
         okx.load_markets()
@@ -278,7 +267,7 @@ def webhook():
 
         market         = okx.market(symbol)
         contract_size  = market['contractSize']
-        position_value = allocated_usd * 10  # 10x kaldıraç
+        position_value = allocated_usd * 10
 
         calculated_qty = position_value / (current_price * contract_size)
         min_qty        = market['limits']['amount']['min']
@@ -301,11 +290,10 @@ def webhook():
         order = okx.create_market_order(symbol=symbol, side=side, amount=final_qty)
         print(f"✅ İŞLEM AÇILDI! Order ID: {order.get('id', 'N/A')}")
 
-        # Pozisyon kaydı
         if not position:
             cursor.execute(
-                "INSERT INTO active_positions (symbol, side, highest_price, lowest_price, last_entry_price, current_step) VALUES (?, ?, ?, ?, ?, ?)",
-                (symbol, side, current_price, current_price, current_price, step)
+                "INSERT INTO active_positions (symbol, side, last_entry_price, current_step) VALUES (?, ?, ?, ?)",
+                (symbol, side, current_price, step)
             )
         else:
             cursor.execute(
