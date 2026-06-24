@@ -2,6 +2,7 @@ import sqlite3
 import json
 from flask import Flask, request, jsonify, render_template_string
 import ccxt
+import traceback
 
 app = Flask(__name__)
 
@@ -68,16 +69,17 @@ init_db()
 
 # --- OKX API BAĞLANTI MOTORU ---
 def get_okx():
-    api_key = get_setting('api_key', '')
-    secret = get_setting('secret', '')
-    passphrase = get_setting('passphrase', '')
+    api_key = get_setting('api_key', '').strip()
+    secret = get_setting('secret', '').strip()
+    passphrase = get_setting('passphrase', '').strip()
     if not api_key or not secret or not passphrase:
         return None
     return ccxt.okx({
         'apiKey': api_key,
         'secret': secret,
         'password': passphrase,
-        'options': {'defaultType': 'swap'}
+        'options': {'defaultType': 'swap'},
+        'enableRateLimit': True
     })
 
 # --- MOBİL PANEL TASARIMI (ANA SAYFA) ---
@@ -175,8 +177,9 @@ def save():
 def webhook():
     try:
         data = json.loads(request.data)
-    except:
-        return jsonify({"status": "error", "message": "Gecersiz JSON paketi"}), 400
+    except Exception as e:
+        print(f"JSON Okuma Hatası: {str(e)}")
+        return jsonify({"status": "error", "message": "Gecersiz JSON paketi"}), 200
 
     raw_symbol = data.get('symbol')
     side = data.get('side', 'buy')
@@ -184,10 +187,10 @@ def webhook():
     current_price = float(data.get('price', 0))
 
     if not raw_symbol or not current_price:
-        return jsonify({"status": "error", "message": "Eksik veri"}), 400
+        return jsonify({"status": "error", "message": "Eksik veri (Symbol veya Price yok)"}), 200
 
-    # OKX parite biçimlendirme hatasını düzeltme (.P uzantılarını temizler ve :USDT yapar)
-    symbol = raw_symbol.replace('.P', '').replace('-','').replace('_','')
+    # OKX parite biçimlendirmesi
+    symbol = raw_symbol.replace('.P', '').replace('-','').replace('_','').strip()
     if "USDT" in symbol and not ":" in symbol:
         symbol = symbol.replace("USDT", "/USDT:USDT")
 
@@ -203,7 +206,8 @@ def webhook():
 
     okx = get_okx()
     if not okx:
-        return jsonify({"status": "error", "message": "OKX API anahtarlari panelde eksik!"}), 400
+        print("HATA: OKX API anahtarları panelde eksik!")
+        return jsonify({"status": "error", "message": "OKX API anahtarlari panelde eksik!"}), 200
 
     conn = sqlite3.connect('bot_settings.db')
     cursor = conn.cursor()
@@ -214,18 +218,18 @@ def webhook():
         highest_step, lowest_step, last_entry_price = position
         if side == 'buy' and step < lowest_step:
             conn.close()
-            return jsonify({"status": "ignored", "message": "Kural 4 engeli aktif."})
+            return jsonify({"status": "ignored", "message": "Kural 4 engeli aktif."}), 200
         
         price_diff_pct = abs(current_price - last_entry_price) / last_entry_price * 100
         if price_diff_pct < min_distance_filter and step > 1:
             conn.close()
-            return jsonify({"status": "ignored", "message": f"Mesafe engeli: %{price_diff_pct:.2f}"})
+            return jsonify({"status": "ignored", "message": f"Mesafe engeli: %{price_diff_pct:.2f}"}), 200
 
     try:
         okx.load_markets()
         order_qty = allocated_usd / current_price
         
-        # OKX üzerinden emrin gönderilmesi
+        # OKX Emir Gönderimi
         order = okx.create_market_order(
             symbol=symbol,
             side=side,
@@ -243,11 +247,15 @@ def webhook():
         
         conn.commit()
         conn.close()
-        return jsonify({"status": "success", "message": "Islem OKX borsasina iletildi."})
+        print(f"BAŞARILI: {symbol} için emir iletildi.")
+        return jsonify({"status": "success", "message": "Islem OKX borsasina iletildi."}), 200
 
     except Exception as e:
         conn.close()
-        return jsonify({"status": "error", "message": str(e)}), 500
+        error_msg = str(e)
+        print(f"OKX BORSASI EMİR REDDETTİ. SEBEP:\n{error_msg}")
+        traceback.print_exc()
+        return jsonify({"status": "error", "okx_error": error_msg}), 200
 
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=5000)
