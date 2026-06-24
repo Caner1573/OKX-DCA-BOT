@@ -80,8 +80,8 @@ def get_okx():
         'options': {'defaultType': 'swap'}
     })
 
-# --- MOBİL PANEL TASARIMI ---
-@app.route('/')
+# --- MOBİL PANEL TASARIMI (ANA SAYFA) ---
+@app.route('/', methods=['GET'])
 def dashboard():
     total, win_rate, total_pnl = get_stats()
     
@@ -170,23 +170,22 @@ def save():
     return '<script>alert("Tüm spesifik ayarlar başarıyla veritabanına işlendi!"); window.location="/";</script>'
 
 
-# --- TRADINGVIEW ALARMLARINI KARŞILAYAN AKILLI WEBHOOK KAPISI ---
+# --- TRADINGVIEW ALARMLARINI KARŞILAYAN GÜVENLİ WEBHOOK KAPISI ---
 @app.route('/webhook', methods=['POST'])
 def webhook():
     try:
         data = json.loads(request.data)
     except:
-        return jsonify({"status": "error", "message": "Geçersiz JSON paketi"}), 400
+        return jsonify({"status": "error", "message": "Gecersiz JSON paketi"}), 400
 
     symbol = data.get('symbol')
-    side = data.get('side', 'buy')  # 'buy' = Long, 'sell' = Short
+    side = data.get('side', 'buy')
     step = int(data.get('step', 1))
     current_price = float(data.get('price', 0))
 
     if not symbol or not current_price:
         return jsonify({"status": "error", "message": "Eksik veri (Symbol veya Price yok)"}), 400
 
-    # Panelden bütçe ayarlarını çek
     budgets = {
         1: float(get_setting('l1_usd', 40)),
         2: float(get_setting('d1_usd', 60)),
@@ -194,16 +193,13 @@ def webhook():
         4: float(get_setting('d3_usd', 135)),
         5: float(get_setting('d4_usd', 202.5))
     }
-    
     allocated_usd = budgets.get(step, 40.0)
     min_distance_filter = float(get_setting('min_dist', 2.0))
 
-    # OKX Borsasına Bağlan
     okx = get_okx()
     if not okx:
-        return jsonify({"status": "error", "message": "OKX API anahtarları panelde girilmemiş!"}), 400
+        return jsonify({"status": "error", "message": "OKX API anahtarlari panelde eksik!"}), 400
 
-    # --- SÜPER FİLTRE VE AKILLI KONTROL MEKANİZMASI ---
     conn = sqlite3.connect('bot_settings.db')
     cursor = conn.cursor()
     cursor.execute("SELECT highest_step, lowest_step, entry_price FROM active_positions WHERE symbol=?", (symbol,))
@@ -211,32 +207,26 @@ def webhook():
 
     if position:
         highest_step, lowest_step, last_entry_price = position
-        
-        # MÜKEMMEL KURAL 4 KONTROLÜ: Eğer gelen sinyal daha yukarı bir kademeyse ve zaten dipteysen ALMA!
         if side == 'buy' and step < lowest_step:
             conn.close()
-            return jsonify({"status": "ignored", "message": f"Kural 4 Aktif: Mevcut dip kademen {lowest_step}. Yukarıdaki {step}. kademe es geçildi."})
+            return jsonify({"status": "ignored", "message": "Kural 4 engeli aktif."})
         
-        # ARADAKİ FARK KONTROLÜ: Son maliyet seviyesi ile yeni seviye arasındaki % mesafe filtreyi kurtarıyor mu?
         price_diff_pct = abs(current_price - last_entry_price) / last_entry_price * 100
         if price_diff_pct < min_distance_filter and step > 1:
             conn.close()
-            return jsonify({"status": "ignored", "message": f"Mesafe Filtresi: İki çizgi arası mesafe %{price_diff_pct:.2f}. Belirlediğin %{min_distance_filter} sınırından küçük! İşlem engellendi."})
+            return jsonify({"status": "ignored", "message": f"Mesafe engeli: %{price_diff_pct:.2f}"})
 
-    # --- OKX EMİR İLETİM MOTORU ---
     try:
-        # Kaldıraçlı piyasada miktarı hesapla (Sözleşme büyüklüğüne göre)
-        market_info = okx.market(symbol)
+        okx.load_markets()
         order_qty = allocated_usd / current_price
         
-        # OKX üzerinden emri piyasa fiyatından fırlat
+        # OKX Piyasasina Göre Alim/Satim Emri Gönderimi
         order = okx.create_market_order(
             symbol=symbol,
             side=side,
             amount=order_qty
         )
         
-        # Veritabanı Pozisyon Durumunu Güncelle
         if not position:
             cursor.execute("INSERT INTO active_positions (symbol, highest_step, lowest_step, entry_price) VALUES (?, ?, ?, ?)",
                            (symbol, step, step, current_price))
@@ -248,11 +238,11 @@ def webhook():
         
         conn.commit()
         conn.close()
-        return jsonify({"status": "success", "order_id": order['id'], "message": f"{step}. Kademe işlem OKX borsa hesabına başarıyla iletildi."})
+        return jsonify({"status": "success", "message": "Islem OKX borsasina iletildi."})
 
     except Exception as e:
         conn.close()
-        return jsonify({"status": "error", "message": f"OKX Emir Hatası: {str(e)}"}), 500
+        return jsonify({"status": "error", "message": str(e)}), 500
 
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=5000)
