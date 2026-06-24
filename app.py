@@ -4,7 +4,8 @@ import os
 import sys
 sys.stdout = sys.stderr
 
-from flask import Flask, request, jsonify, render_template_string, Markup
+from flask import Flask, request, jsonify, render_template_string
+from markupsafe import Markup 
 import ccxt
 import math
 import threading
