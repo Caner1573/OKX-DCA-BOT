@@ -125,7 +125,6 @@ def dashboard():
     </head>
     <body>
         <h3 style="text-align: center; color: #4caf50;">🤖 S-DCA ÖZEL KONTROL PANELİ</h3>
-        
         <form action="/save" method="POST">
             <div class="card">
                 <h2>1. OKX API BAĞLANTISI</h2>
@@ -133,7 +132,6 @@ def dashboard():
                 <label>Secret Key:</label><input type="password" name="secret" value="{{secret}}">
                 <label>Passphrase:</label><input type="password" name="passphrase" value="{{passphrase}}">
             </div>
-
             <div class="card">
                 <h2>2. KADEMELİ BÜTÇE AYARLARI ($)</h2>
                 <label>LONG 1:</label><input type="number" name="l1_usd" value="{{l1_usd}}">
@@ -142,7 +140,6 @@ def dashboard():
                 <label>DCA 3:</label><input type="number" name="d3_usd" value="{{d3_usd}}">
                 <label>DCA 4:</label><input type="number" name="d4_usd" value="{{d4_usd}}">
             </div>
-
             <div class="card">
                 <h2>3. SPESİFİK AYARLAR & FILTRELER</h2>
                 <label>Min. Fibo Uzaklık Filtresi (%):</label><input type="number" step="0.1" name="min_dist" value="{{min_dist}}">
@@ -153,13 +150,6 @@ def dashboard():
             </div>
             <button type="submit">TÜM AYARLARI GÜNCELLE</button>
         </form>
-
-        <div class="card" style="margin-top: 15px;">
-            <h2>📊 PERFORMANS VE ANALİTİK TABLOSU</h2>
-            <div class="stat-box"><span>Toplam İşlem:</span><strong>{{total}}</strong></div>
-            <div class="stat-box"><span>Win Rate (Kazanma Oranı):</span><span style="color:#4caf50;">{{win_rate}}</span></div>
-            <div class="stat-box"><span>Net Kazanç (PNL):</span><span style="color:#4caf50;">{{pnl}}</span></div>
-        </div>
     </body>
     </html>
     '''
@@ -169,8 +159,7 @@ def dashboard():
 def save():
     for key in request.form:
         save_setting(key, request.form[key])
-    return '<script>alert("Tüm spesifik ayarlar başarıyla veritabanına işlendi!"); window.location="/";</script>'
-
+    return '<script>alert("Ayarlar güncellendi!"); window.location="/";</script>'
 
 # --- TRADINGVIEW WEBHOOK KAPISI ---
 @app.route('/webhook', methods=['POST'])
@@ -204,7 +193,7 @@ def webhook():
 
     okx = get_okx()
     if not okx:
-        return jsonify({"status": "error", "message": "OKX API anahtarlari eksik!"}), 200
+        return jsonify({"status": "error", "message": "OKX API anahtarlari girilmemis!"}), 200
 
     conn = sqlite3.connect('bot_settings.db')
     cursor = conn.cursor()
@@ -225,24 +214,18 @@ def webhook():
     try:
         okx.load_markets()
         
-        # 10x KALDIRAÇ VE SABİT CROSS MARJİN AYARLARINI BORSAYA DAYATMA
         try:
-            # Marjin modunu Çapraz (Cross) yapıyoruz
             okx.set_margin_mode('cross', symbol)
-        except Exception as margin_err:
-            print(f"Marjin modu ayarlanamadı (Zaten Cross olabilir): {str(margin_err)}")
+        except:
+            pass
 
         try:
-            # Kaldıracı sabit 10x yapıyoruz
             okx.set_leverage(10, symbol, {'mgnMode': 'cross'})
-        except Exception as lev_err:
-            print(f"Kaldıraç ayarlanamadı (Zaten 10x olabilir): {str(lev_err)}")
+        except:
+            pass
 
-        # Kaldıraçlı bütçeye göre kontrat büyüklüğü hesabı
-        # 10x kaldıraca göre ayrılan USD bütçesi kadar büyüklük gönderilir
         order_qty = (allocated_usd * 10) / current_price
         
-        # OKX üzerinden emrin gönderilmesi
         order = okx.create_market_order(
             symbol=symbol,
             side=side,
@@ -264,9 +247,9 @@ def webhook():
 
     except Exception as e:
         conn.close()
+        # İŞTE BURASI: Borsanın verdiği gerçek hatayı TradingView ekranına fırlatıyoruz!
         error_msg = str(e)
-        print(f"OKX EMİR HATASI: {error_msg}")
-        return jsonify({"status": "error", "okx_error": error_msg}), 200
+        return jsonify({"status": "error", "okx_gercek_hatasi": error_msg}), 200
 
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=5000)
