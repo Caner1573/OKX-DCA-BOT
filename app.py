@@ -82,7 +82,7 @@ def get_okx():
         'enableRateLimit': True
     })
 
-# --- MOBİL PANEL TASARIMI (ANA SAYFA) ---
+# --- MOBİL PANEL TASARIMI ---
 @app.route('/', methods=['GET'])
 def dashboard():
     total, win_rate, total_pnl = get_stats()
@@ -172,13 +172,12 @@ def save():
     return '<script>alert("Tüm spesifik ayarlar başarıyla veritabanına işlendi!"); window.location="/";</script>'
 
 
-# --- TRADINGVIEW ALARMLARINI KARŞILAYAN GÜVENLİ WEBHOOK KAPISI ---
+# --- TRADINGVIEW WEBHOOK KAPISI ---
 @app.route('/webhook', methods=['POST'])
 def webhook():
     try:
         data = json.loads(request.data)
     except Exception as e:
-        print(f"JSON Okuma Hatası: {str(e)}")
         return jsonify({"status": "error", "message": "Gecersiz JSON paketi"}), 200
 
     raw_symbol = data.get('symbol')
@@ -187,9 +186,8 @@ def webhook():
     current_price = float(data.get('price', 0))
 
     if not raw_symbol or not current_price:
-        return jsonify({"status": "error", "message": "Eksik veri (Symbol veya Price yok)"}), 200
+        return jsonify({"status": "error", "message": "Eksik veri"}), 200
 
-    # OKX parite biçimlendirmesi
     symbol = raw_symbol.replace('.P', '').replace('-','').replace('_','').strip()
     if "USDT" in symbol and not ":" in symbol:
         symbol = symbol.replace("USDT", "/USDT:USDT")
@@ -206,8 +204,7 @@ def webhook():
 
     okx = get_okx()
     if not okx:
-        print("HATA: OKX API anahtarları panelde eksik!")
-        return jsonify({"status": "error", "message": "OKX API anahtarlari panelde eksik!"}), 200
+        return jsonify({"status": "error", "message": "OKX API anahtarlari eksik!"}), 200
 
     conn = sqlite3.connect('bot_settings.db')
     cursor = conn.cursor()
@@ -227,9 +224,25 @@ def webhook():
 
     try:
         okx.load_markets()
-        order_qty = allocated_usd / current_price
         
-        # OKX Emir Gönderimi
+        # 10x KALDIRAÇ VE SABİT CROSS MARJİN AYARLARINI BORSAYA DAYATMA
+        try:
+            # Marjin modunu Çapraz (Cross) yapıyoruz
+            okx.set_margin_mode('cross', symbol)
+        except Exception as margin_err:
+            print(f"Marjin modu ayarlanamadı (Zaten Cross olabilir): {str(margin_err)}")
+
+        try:
+            # Kaldıracı sabit 10x yapıyoruz
+            okx.set_leverage(10, symbol, {'mgnMode': 'cross'})
+        except Exception as lev_err:
+            print(f"Kaldıraç ayarlanamadı (Zaten 10x olabilir): {str(lev_err)}")
+
+        # Kaldıraçlı bütçeye göre kontrat büyüklüğü hesabı
+        # 10x kaldıraca göre ayrılan USD bütçesi kadar büyüklük gönderilir
+        order_qty = (allocated_usd * 10) / current_price
+        
+        # OKX üzerinden emrin gönderilmesi
         order = okx.create_market_order(
             symbol=symbol,
             side=side,
@@ -247,14 +260,12 @@ def webhook():
         
         conn.commit()
         conn.close()
-        print(f"BAŞARILI: {symbol} için emir iletildi.")
-        return jsonify({"status": "success", "message": "Islem OKX borsasina iletildi."}), 200
+        return jsonify({"status": "success", "message": "Islem OKX borsasina 10x Cross olarak iletildi."}), 200
 
     except Exception as e:
         conn.close()
         error_msg = str(e)
-        print(f"OKX BORSASI EMİR REDDETTİ. SEBEP:\n{error_msg}")
-        traceback.print_exc()
+        print(f"OKX EMİR HATASI: {error_msg}")
         return jsonify({"status": "error", "okx_error": error_msg}), 200
 
 if __name__ == '__main__':
