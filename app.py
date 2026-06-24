@@ -45,7 +45,8 @@ def init_db():
             avg_entry_price   REAL DEFAULT 0,
             total_contracts   REAL DEFAULT 0,
             tp1_done          INTEGER DEFAULT 0,
-            tp2_done          INTEGER DEFAULT 0
+            tp2_done          INTEGER DEFAULT 0,
+            sl_active         INTEGER DEFAULT 0
         )
     ''')
     cursor.execute('''
@@ -72,6 +73,7 @@ def init_db():
         ('total_contracts', 'REAL DEFAULT 0'),
         ('tp1_done',        'INTEGER DEFAULT 0'),
         ('tp2_done',        'INTEGER DEFAULT 0'),
+        ('sl_active',       'INTEGER DEFAULT 0'),
     ]:
         if col not in existing:
             cursor.execute(f"ALTER TABLE active_positions ADD COLUMN {col} {definition}")
@@ -168,12 +170,12 @@ def tp_monitor():
         try:
             conn   = sqlite3.connect('bot_settings.db')
             cursor = conn.cursor()
-            cursor.execute("SELECT symbol, side, avg_entry_price, total_contracts, tp1_done, tp2_done FROM active_positions")
+            cursor.execute("SELECT symbol, side, avg_entry_price, total_contracts, tp1_done, tp2_done, sl_active FROM active_positions")
             positions = cursor.fetchall()
             conn.close()
 
             for pos in positions:
-                symbol, side, avg_price, total_contracts, tp1_done, tp2_done = pos
+                symbol, side, avg_price, total_contracts, tp1_done, tp2_done, sl_active = pos
                 if not avg_price or avg_price == 0:
                     continue
                 if not total_contracts or total_contracts == 0:
@@ -197,20 +199,52 @@ def tp_monitor():
                         hit_tp1   = cur_price >= tp1_price
                         hit_tp2   = cur_price >= tp2_price
                         pnl_pct   = (cur_price - avg_price) / avg_price * 100
+                        # SL kontrolü: TP1 sonrası fiyat avg_entry'nin altına düşerse
+                        hit_sl    = sl_active and (cur_price <= avg_price)
                     else:
                         tp1_price = avg_price * (1 - tp1_pct)
                         tp2_price = avg_price * (1 - tp2_pct)
                         hit_tp1   = cur_price <= tp1_price
                         hit_tp2   = cur_price <= tp2_price
                         pnl_pct   = (avg_price - cur_price) / avg_price * 100
+                        # SL kontrolü: TP1 sonrası fiyat avg_entry'nin üstüne çıkarsa
+                        hit_sl    = sl_active and (cur_price >= avg_price)
 
                     close_side = 'sell' if side == 'buy' else 'buy'
                     pos_side   = 'long' if side == 'buy' else 'short'
                     pos_val    = avg_price * total_contracts
                     pnl_usd    = pos_val * (pnl_pct / 100) * 10
 
-                    print(f"👁 {symbol} | Fiyat:{cur_price} | Ort:{avg_price:.4f} | TP1:{tp1_price:.4f} | TP2:{tp2_price:.4f}")
+                    print(f"👁 {symbol} | Fiyat:{cur_price} | Ort:{avg_price:.4f} | TP1:{tp1_price:.4f} | TP2:{tp2_price:.4f} | SL_Aktif:{bool(sl_active)}")
 
+                    # --- SL KONTROLÜ (TP1 sonrası breakeven) ---
+                    if hit_sl and not tp2_done:
+                        print(f"🛡 SL TETİKLENDİ → {symbol} | Fiyat:{cur_price} | Entry:{avg_price}")
+                        okx.create_market_order(
+                            symbol=symbol, side=close_side, amount=total_contracts,
+                            params={"posSide": pos_side, "reduceOnly": True}
+                        )
+                        sym_short = symbol.replace('/USDT:USDT', '')
+                        # PnL ~0 çünkü entry fiyatında kapandı
+                        send_telegram(
+                            f"🛡 <b>SL (Breakeven) Tetiklendi!</b>\n"
+                            f"Sembol: <b>{sym_short}</b>\n"
+                            f"Yön: {'LONG' if side=='buy' else 'SHORT'}\n"
+                            f"Fiyat: ${cur_price:.4f}\n"
+                            f"Entry: ${avg_price:.4f}\n"
+                            f"PnL: ~$0 (Breakeven koruması)"
+                        )
+                        conn2  = sqlite3.connect('bot_settings.db')
+                        cur2   = conn2.cursor()
+                        cur2.execute("INSERT INTO trades (symbol,side,status,pnl,closed_at) VALUES (?,?,?,?,?)",
+                                     (symbol, side, 'SL_BREAKEVEN', round(pnl_usd, 2), datetime.now().strftime('%Y-%m-%d %H:%M')))
+                        cur2.execute("DELETE FROM active_positions WHERE symbol=?", (symbol,))
+                        conn2.commit()
+                        conn2.close()
+                        print(f"🏁 {symbol} SL ile kapatıldı")
+                        continue
+
+                    # --- TP2 KONTROLÜ ---
                     if hit_tp2 and not tp2_done:
                         qty = math.floor(total_contracts * tp2_qty * 10) / 10
                         if qty <= 0:
@@ -242,6 +276,7 @@ def tp_monitor():
                         conn2.commit()
                         conn2.close()
 
+                    # --- TP1 KONTROLÜ ---
                     elif hit_tp1 and not tp1_done:
                         qty = math.floor(total_contracts * tp1_qty * 10) / 10
                         if qty <= 0:
@@ -250,20 +285,24 @@ def tp_monitor():
                             symbol=symbol, side=close_side, amount=qty,
                             params={"posSide": pos_side, "reduceOnly": True}
                         )
-                        print(f"✅ TP1 → {symbol} | {qty} kontrat")
+                        print(f"✅ TP1 → {symbol} | {qty} kontrat | SL aktifleştiriliyor @ {avg_price:.4f}")
                         sym_short = symbol.replace('/USDT:USDT', '')
                         send_telegram(
                             f"🎯 <b>TP1 HIT!</b>\n"
                             f"Sembol: <b>{sym_short}</b>\n"
                             f"Yön: {'LONG' if side=='buy' else 'SHORT'}\n"
                             f"Fiyat: ${cur_price:.4f}\n"
-                            f"PnL: +${pnl_usd:.2f} USDT (+{pnl_pct:.2f}%)"
+                            f"PnL: +${pnl_usd:.2f} USDT (+{pnl_pct:.2f}%)\n"
+                            f"🛡 SL Breakeven aktif @ ${avg_price:.4f}"
                         )
                         conn2  = sqlite3.connect('bot_settings.db')
                         cur2   = conn2.cursor()
                         remaining = max(0, total_contracts - qty)
-                        cur2.execute("UPDATE active_positions SET tp1_done=1, total_contracts=? WHERE symbol=?",
-                                     (remaining, symbol))
+                        # tp1_done=1 ve sl_active=1 aynı anda set ediliyor
+                        cur2.execute(
+                            "UPDATE active_positions SET tp1_done=1, sl_active=1, total_contracts=? WHERE symbol=?",
+                            (remaining, symbol)
+                        )
                         conn2.commit()
                         conn2.close()
 
@@ -286,7 +325,7 @@ def dashboard():
 
     conn   = sqlite3.connect('bot_settings.db')
     cursor = conn.cursor()
-    cursor.execute("SELECT symbol, side, avg_entry_price, total_contracts, current_step, tp1_done, tp2_done FROM active_positions")
+    cursor.execute("SELECT symbol, side, avg_entry_price, total_contracts, current_step, tp1_done, tp2_done, sl_active FROM active_positions")
     active_pos = cursor.fetchall()
 
     cursor.execute("SELECT pnl, recorded_at FROM pnl_history ORDER BY id DESC LIMIT 24")
@@ -300,7 +339,7 @@ def dashboard():
 
     pos_json = json.dumps([
         {"symbol": p[0], "side": p[1], "avgPrice": p[2], "contracts": p[3],
-         "step": p[4], "tp1Done": bool(p[5]), "tp2Done": bool(p[6])}
+         "step": p[4], "tp1Done": bool(p[5]), "tp2Done": bool(p[6]), "slActive": bool(p[7])}
         for p in active_pos
     ])
 
@@ -364,10 +403,13 @@ body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;backgrou
 .pnl-bar-bg{height:3px;background:#222;border-radius:2px;overflow:hidden}
 .pnl-bar-fill{height:100%;border-radius:2px}
 .pos-footer{display:flex;justify-content:space-between;align-items:center;padding:8px 14px 10px}
-.tp-pills{display:flex;gap:5px}
+.tp-pills{display:flex;gap:5px;flex-wrap:wrap}
 .tp-pill{font-size:9px;font-weight:600;padding:2px 7px;border-radius:10px}
 .tp-wait{background:#1e1e22;color:#555;border:1px solid #2a2a2e}
 .tp-hit{background:#1a3a1a;color:#4caf50}
+.sl-pill{font-size:9px;font-weight:600;padding:2px 7px;border-radius:10px}
+.sl-wait{background:#1e1e22;color:#555;border:1px solid #2a2a2e}
+.sl-active-pill{background:#1a1a3a;color:#ff9800;border:1px solid #ff9800}
 .close-btn{font-size:10px;font-weight:600;padding:5px 12px;border-radius:6px;border:1px solid #f44336;background:transparent;color:#f44336;cursor:pointer}
 label{display:block;margin:10px 0 3px;color:#555;font-size:0.72rem;text-transform:uppercase;letter-spacing:.4px}
 input{width:100%;padding:10px 12px;background:#0d0d0f;border:1px solid #2a2a2e;border-radius:8px;color:#e0e0e0;font-size:0.88rem}
@@ -449,7 +491,6 @@ function renderPositions(prices){
     container.innerHTML = '<div class="no-pos">Aktif pozisyon yok</div>';
     return;
   }
-  let totalPnl = 0;
   let html = '';
   POSITIONS.forEach(p=>{
     const cur = prices[p.symbol] || p.avgPrice;
@@ -457,7 +498,6 @@ function renderPositions(prices){
     const pnlPct = (cur - p.avgPrice)/p.avgPrice*100*dir;
     const posVal = p.avgPrice * p.contracts;
     const pnlUsd = posVal*(pnlPct/100)*10;
-    totalPnl += pnlUsd;
     const isPos = pnlUsd>=0;
     const cls = isPos?'pos-val':'neg-val';
     const barW = Math.min(Math.abs(pnlPct)*15,100);
@@ -485,7 +525,7 @@ function renderPositions(prices){
         <div class="cell"><div class="clabel">TP1'e Uzaklık</div><div class="cval neu-val">${fmt(dist,2)}%</div></div>
       </div>
       <div class="pnl-bar-wrap">
-        <div class="pnl-bar-label"><span>TP1 $${tp1p.toFixed(4)}</span><span>TP2 $${tp2p.toFixed(4)}</span></div>
+        <div class="pnl-bar-label"><span>SL $${p.avgPrice.toFixed(4)}</span><span>TP1 $${tp1p.toFixed(4)} | TP2 $${tp2p.toFixed(4)}</span></div>
         <div class="pnl-bar-bg"><div class="pnl-bar-fill" style="width:${barW}%;background:${barClr}"></div></div>
       </div>
       <div class="divider"></div>
@@ -493,6 +533,7 @@ function renderPositions(prices){
         <div class="tp-pills">
           <span class="tp-pill ${p.tp1Done?'tp-hit':'tp-wait'}">TP1 ${p.tp1Done?'✓':'bekliyor'}</span>
           <span class="tp-pill ${p.tp2Done?'tp-hit':'tp-wait'}">TP2 ${p.tp2Done?'✓':'bekliyor'}</span>
+          <span class="sl-pill ${p.slActive?'sl-active-pill':'sl-wait'}">🛡 SL ${p.slActive?'AKTİF':'bekliyor'}</span>
         </div>
         <button class="close-btn" onclick="closePos('${p.symbol}','${p.side}')">✖ Kapat</button>
       </div>
@@ -520,7 +561,6 @@ async function refresh(){
 refresh();
 setInterval(refresh, 10000);
 
-// PnL Grafiği
 if(PNL_DATA.length > 1){
   new Chart(document.getElementById('pnlChart'),{
     type:'line',
@@ -775,7 +815,7 @@ def webhook():
 
         if not position:
             cursor.execute(
-                "INSERT INTO active_positions (symbol,side,last_entry_price,current_step,avg_entry_price,total_contracts) VALUES (?,?,?,?,?,?)",
+                "INSERT INTO active_positions (symbol,side,last_entry_price,current_step,avg_entry_price,total_contracts,sl_active) VALUES (?,?,?,?,?,?,0)",
                 (symbol, side, current_price, step, current_price, final_qty)
             )
         else:
