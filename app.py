@@ -3,6 +3,7 @@ import json
 from flask import Flask, request, jsonify, render_template_string
 import ccxt
 import traceback
+import math
 
 app = Flask(__name__)
 
@@ -19,16 +20,6 @@ def init_db():
             entry_price REAL,
             tp1_hit INTEGER DEFAULT 0,
             current_contracts REAL DEFAULT 0
-        )
-    ''')
-    cursor.execute('''
-        CREATE TABLE IF NOT EXISTS trades (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            symbol TEXT,
-            side TEXT,
-            status TEXT,
-            pnl REAL,
-            steps_used TEXT
         )
     ''')
     conn.commit()
@@ -49,22 +40,6 @@ def get_setting(key, default):
     conn.close()
     return row[0] if row else default
 
-def get_stats():
-    conn = sqlite3.connect('bot_settings.db')
-    cursor = conn.cursor()
-    try:
-        cursor.execute("SELECT COUNT(*), SUM(CASE WHEN pnl > 0 THEN 1 ELSE 0 END), SUM(pnl) FROM trades")
-        row = cursor.fetchone()
-        total = row[0] if row[0] else 0
-        wins = row[1] if row[1] else 0
-        total_pnl = row[2] if row[2] else 0.0
-        win_rate = (wins / total * 100) if total > 0 else 0
-    except:
-        total, win_rate, total_pnl = 0, 0, 0.0
-    finally:
-        conn.close()
-    return total, win_rate, total_pnl
-
 init_db()
 
 # --- OKX API BAĞLANTI MOTORU ---
@@ -82,11 +57,9 @@ def get_okx():
         'enableRateLimit': True
     })
 
-# --- MOBİL PANEL TASARIMI ---
+# --- MOBİL PANEL ---
 @app.route('/', methods=['GET'])
 def dashboard():
-    total, win_rate, total_pnl = get_stats()
-    
     context = {
         'api_key': get_setting('api_key', ''),
         'secret': get_setting('secret', ''),
@@ -97,58 +70,39 @@ def dashboard():
         'd3_usd': get_setting('d3_usd', '135'),
         'd4_usd': get_setting('d4_usd', '202.5'),
         'min_dist': get_setting('min_dist', '2.0'),
-        'tp1_pct': get_setting('tp1_pct', '1.5'),
-        'tp1_qty': get_setting('tp1_qty', '50'),
-        'tp2_pct': get_setting('tp2_pct', '3.0'),
-        'tp2_qty': get_setting('tp2_qty', '50'),
-        'total': total,
-        'win_rate': f"{win_rate:.1f}%",
-        'pnl': f"{total_pnl:.2f} USDT"
     }
-
     html_template = '''
     <!DOCTYPE html>
     <html>
     <head>
         <meta charset="UTF-8">
         <meta name="viewport" content="width=device-width, initial-scale=1.0">
-        <title>OKX Algoritmik Mükemmel Strateji</title>
+        <title>OKX Kontrol Paneli</title>
         <style>
             body { font-family: sans-serif; background: #121214; color: #fff; padding: 10px; margin: 0; }
-            .card { background: #1a1a1e; padding: 15px; border-radius: 8px; margin-bottom: 15px; box-shadow: 0 4px 6px rgba(0,0,0,0.2); }
-            h2 { color: #4caf50; font-size: 1rem; margin-top: 0; border-bottom: 1px solid #26262b; padding-bottom: 5px;}
+            .card { background: #1a1a1e; padding: 15px; border-radius: 8px; margin-bottom: 15px; }
             label { display: block; margin: 8px 0 2px; color: #aaa; font-size: 0.8rem; }
-            input { width: 100%; padding: 10px; background: #26262b; border: 1px solid #3a3a42; border-radius: 4px; color: #fff; box-sizing: border-box; font-size: 0.9rem; }
-            button { width: 100%; padding: 14px; background: #4caf50; border: none; border-radius: 4px; color: #fff; font-weight: bold; font-size: 1rem; margin-top: 10px; }
-            .stat-box { display: flex; justify-content: space-between; background: #26262b; padding: 10px; border-radius: 4px; margin-bottom: 5px; font-size: 0.9rem;}
+            input { width: 100%; padding: 10px; background: #26262b; border: 1px solid #3a3a42; border-radius: 4px; color: #fff; box-sizing: border-box; }
+            button { width: 100%; padding: 14px; background: #4caf50; border: none; border-radius: 4px; color: #fff; font-weight: bold; margin-top: 10px; }
         </style>
     </head>
     <body>
-        <h3 style="text-align: center; color: #4caf50;">🤖 S-DCA ÖZEL KONTROL PANELİ</h3>
+        <h3 style="text-align: center; color: #4caf50;">🤖 DCA BOT SİSTEMİ</h3>
         <form action="/save" method="POST">
             <div class="card">
-                <h2>1. OKX API BAĞLANTISI</h2>
                 <label>API Key:</label><input type="text" name="api_key" value="{{api_key}}">
                 <label>Secret Key:</label><input type="password" name="secret" value="{{secret}}">
                 <label>Passphrase:</label><input type="password" name="passphrase" value="{{passphrase}}">
             </div>
             <div class="card">
-                <h2>2. KADEMELİ BÜTÇE AYARLARI ($)</h2>
-                <label>LONG 1:</label><input type="number" name="l1_usd" value="{{l1_usd}}">
-                <label>DCA 1 (1.5x):</label><input type="number" name="d1_usd" value="{{d1_usd}}">
-                <label>DCA 2:</label><input type="number" name="d2_usd" value="{{d2_usd}}">
-                <label>DCA 3:</label><input type="number" name="d3_usd" value="{{d3_usd}}">
-                <label>DCA 4:</label><input type="number" name="d4_usd" value="{{d4_usd}}">
+                <label>LONG 1 ($):</label><input type="number" name="l1_usd" value="{{l1_usd}}">
+                <label>DCA 1 ($):</label><input type="number" name="d1_usd" value="{{d1_usd}}">
+                <label>DCA 2 ($):</label><input type="number" name="d2_usd" value="{{d2_usd}}">
+                <label>DCA 3 ($):</label><input type="number" name="d3_usd" value="{{d3_usd}}">
+                <label>DCA 4 ($):</label><input type="number" name="d4_usd" value="{{d4_usd}}">
+                <label>Min Mesafe (%):</label><input type="number" step="0.1" name="min_dist" value="{{min_dist}}">
             </div>
-            <div class="card">
-                <h2>3. SPESİFİK AYARLAR & FILTRELER</h2>
-                <label>Min. Fibo Uzaklık Filtresi (%):</label><input type="number" step="0.1" name="min_dist" value="{{min_dist}}">
-                <label>TP 1 Oranı (%):</label><input type="number" step="0.1" name="tp1_pct" value="{{tp1_pct}}">
-                <label>TP 1 Satış Oranı (%):</label><input type="number" name="tp1_qty" value="{{tp1_qty}}">
-                <label>TP 2 Oranı (%):</label><input type="number" step="0.1" name="tp2_pct" value="{{tp2_pct}}">
-                <label>TP 2 Satış Oranı (%):</label><input type="number" name="tp2_qty" value="{{tp2_qty}}">
-            </div>
-            <button type="submit">TÜM AYARLARI GÜNCELLE</button>
+            <button type="submit">AYARLARI KAYDET</button>
         </form>
     </body>
     </html>
@@ -159,15 +113,15 @@ def dashboard():
 def save():
     for key in request.form:
         save_setting(key, request.form[key])
-    return '<script>alert("Ayarlar güncellendi!"); window.location="/";</script>'
+    return '<script>alert("Ayarlar Basariyla Kaydedildi!"); window.location="/";</script>'
 
-# --- TRADINGVIEW WEBHOOK KAPISI ---
+# --- WEBHOOK KAPISI ---
 @app.route('/webhook', methods=['POST'])
 def webhook():
     try:
         data = json.loads(request.data)
-    except Exception as e:
-        return jsonify({"status": "error", "message": "Gecersiz JSON paketi"}), 200
+    except:
+        return jsonify({"status": "error", "message": "Gecersiz JSON"}), 200
 
     raw_symbol = data.get('symbol')
     side = data.get('side', 'buy')
@@ -189,67 +143,72 @@ def webhook():
         5: float(get_setting('d4_usd', 202.5))
     }
     allocated_usd = budgets.get(step, 40.0)
-    min_distance_filter = float(get_setting('min_dist', 2.0))
 
     okx = get_okx()
     if not okx:
-        return jsonify({"status": "error", "message": "OKX API anahtarlari girilmemis!"}), 200
-
-    conn = sqlite3.connect('bot_settings.db')
-    cursor = conn.cursor()
-    cursor.execute("SELECT highest_step, lowest_step, entry_price FROM active_positions WHERE symbol=?", (symbol,))
-    position = cursor.fetchone()
-
-    if position:
-        highest_step, lowest_step, last_entry_price = position
-        if side == 'buy' and step < lowest_step:
-            conn.close()
-            return jsonify({"status": "ignored", "message": "Kural 4 engeli aktif."}), 200
-        
-        price_diff_pct = abs(current_price - last_entry_price) / last_entry_price * 100
-        if price_diff_pct < min_distance_filter and step > 1:
-            conn.close()
-            return jsonify({"status": "ignored", "message": f"Mesafe engeli: %{price_diff_pct:.2f}"}), 200
+        return jsonify({"status": "error", "message": "API eksik"}), 200
 
     try:
         okx.load_markets()
         
+        # 1. Kaldıraç ve Mod Dayatma
         try:
             okx.set_margin_mode('cross', symbol)
         except:
             pass
-
         try:
             okx.set_leverage(10, symbol, {'mgnMode': 'cross'})
         except:
             pass
 
-        order_qty = (allocated_usd * 10) / current_price
+        # 2. BORSANIN KURALLARINI ÖĞRENME SEKANSI
+        market = okx.market(symbol)
         
+        # OKX vadeli işlemlerde emir adet bazında değil "kontrat (contract)" bazında gönderilir.
+        # 10x kaldıraç dahil toplam pozisyon büyüklüğü hesaplanır:
+        total_position_value = allocated_usd * 10
+        
+        # Borsanın 1 kontratının kaç adet coine denk geldiğini buluyoruz (contractSize)
+        contract_size = market['contractSize']
+        
+        # Kaç adet kontrat almamız gerektiğini hesaplıyoruz:
+        calculated_qty = total_position_value / (current_price * contract_size)
+        
+        # Borsanın izin verdiği minimum kontrat sınırını kontrol ediyoruz
+        min_qty = market['limits']['amount']['min']
+        
+        # Hesaplanan kontrat adedi, borsanın minimum sınırından küçükse zorunlu olarak minimum sınıra eşitliyoruz
+        if calculated_qty < min_qty:
+            calculated_qty = min_qty
+            
+        # Kontrat adedini borsanın basamak hassasiyetine göre aşağı yuvarlıyoruz (Örn: 1.23 -> 1)
+        precision = market['precision']['amount']
+        
+        if precision is not None:
+            # OKX kontratları genelde tam sayıdır (0 hassasiyet), hassasiyete göre güvenli yuvarlama:
+            d = int(math.log10(1/precision)) if precision > 0 else 0
+            final_qty = math.floor(calculated_qty * (10 ** d)) / (10 ** d)
+        else:
+            final_qty = math.floor(calculated_qty)
+
+        if final_qty <= 0:
+            final_qty = 1 # Güvenlik sınırı
+
+        print(f"EMİR HAZIRLANDI -> Sembol: {symbol}, Hesaplanan Kontrat: {final_qty}")
+
+        # 3. Kusursuz Formatlanmış Emri Gönderme
         order = okx.create_market_order(
             symbol=symbol,
             side=side,
-            amount=order_qty
+            amount=final_qty
         )
         
-        if not position:
-            cursor.execute("INSERT INTO active_positions (symbol, highest_step, lowest_step, entry_price) VALUES (?, ?, ?, ?)",
-                           (symbol, step, step, current_price))
-        else:
-            new_high = max(position[0], step)
-            new_low = max(position[1], step)
-            cursor.execute("UPDATE active_positions SET highest_step=?, lowest_step=?, entry_price=? WHERE symbol=?",
-                           (new_high, new_low, current_price, symbol))
-        
-        conn.commit()
-        conn.close()
-        return jsonify({"status": "success", "message": "Islem OKX borsasina 10x Cross olarak iletildi."}), 200
+        print("BORSADA İŞLEM BAŞARIYLA AÇILDI!")
+        return jsonify({"status": "success", "message": f"Islem {final_qty} kontrat olarak acildi!"}), 200
 
     except Exception as e:
-        conn.close()
-        # İŞTE BURASI: Borsanın verdiği gerçek hatayı TradingView ekranına fırlatıyoruz!
-        error_msg = str(e)
-        return jsonify({"status": "error", "okx_gercek_hatasi": error_msg}), 200
+        print(f"KOD İÇİ HATA DETAYI: {str(e)}")
+        return jsonify({"status": "error", "okx_error": str(e)}), 200
 
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=5000)
