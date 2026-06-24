@@ -9,9 +9,7 @@ app = Flask(__name__)
 def init_db():
     conn = sqlite3.connect('bot_settings.db')
     cursor = conn.cursor()
-    # Ayarlar Tablosu
     cursor.execute('CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT)')
-    # Aktif Pozisyon Takip Tablosu
     cursor.execute('''
         CREATE TABLE IF NOT EXISTS active_positions (
             symbol TEXT PRIMARY KEY,
@@ -22,7 +20,6 @@ def init_db():
             current_contracts REAL DEFAULT 0
         )
     ''')
-    # İstatistik ve Geçmiş Tablosu
     cursor.execute('''
         CREATE TABLE IF NOT EXISTS trades (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -54,13 +51,17 @@ def get_setting(key, default):
 def get_stats():
     conn = sqlite3.connect('bot_settings.db')
     cursor = conn.cursor()
-    cursor.execute("SELECT COUNT(*), SUM(CASE WHEN pnl > 0 THEN 1 ELSE 0 END), SUM(pnl) FROM trades")
-    row = cursor.fetchone()
-    conn.close()
-    total = row[0] if row[0] else 0
-    wins = row[1] if row[1] else 0
-    total_pnl = row[2] if row[2] else 0.0
-    win_rate = (wins / total * 100) if total > 0 else 0
+    try:
+        cursor.execute("SELECT COUNT(*), SUM(CASE WHEN pnl > 0 THEN 1 ELSE 0 END), SUM(pnl) FROM trades")
+        row = cursor.fetchone()
+        total = row[0] if row[0] else 0
+        wins = row[1] if row[1] else 0
+        total_pnl = row[2] if row[2] else 0.0
+        win_rate = (wins / total * 100) if total > 0 else 0
+    except:
+        total, win_rate, total_pnl = 0, 0, 0.0
+    finally:
+        conn.close()
     return total, win_rate, total_pnl
 
 init_db()
@@ -70,7 +71,7 @@ def get_okx():
     api_key = get_setting('api_key', '')
     secret = get_setting('secret', '')
     passphrase = get_setting('passphrase', '')
-    if not api_key or !secret or !passphrase:
+    if not api_key or not secret or not passphrase:
         return None
     return ccxt.okx({
         'apiKey': api_key,
@@ -79,12 +80,11 @@ def get_okx():
         'options': {'defaultType': 'swap'}
     })
 
-# --- MOBİL PANEL TASARIMI (TÜM AYARLAR DAHİL) ---
+# --- MOBİL PANEL TASARIMI ---
 @app.route('/')
 def dashboard():
     total, win_rate, total_pnl = get_stats()
     
-    # Mevcut ayarları veritabanından çekip form kutularına basıyoruz
     context = {
         'api_key': get_setting('api_key', ''),
         'secret': get_setting('secret', ''),
