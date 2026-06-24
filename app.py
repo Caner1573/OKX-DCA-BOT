@@ -4,7 +4,9 @@ import os
 from flask import Flask, request, jsonify, render_template_string
 import ccxt
 import math
-
+import os
+import sys
+sys.stdout = sys.stderr
 app = Flask(__name__)
 
 FIXED_API_KEY    = os.environ.get('OKX_API_KEY', 'e7ef3692-6430-45b5-a882-9a98bf72fe36')
