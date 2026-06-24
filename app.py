@@ -260,8 +260,10 @@ def webhook():
         except Exception as e:
             print(f"ℹ️ Margin: {e}")
 
+        # ✅ DÜZELTME 1: Hedge mode için her iki yöne ayrı leverage
         try:
-            okx.set_leverage(10, symbol, {'mgnMode': 'cross'})
+            okx.set_leverage(10, symbol, {'mgnMode': 'cross', 'posSide': 'long'})
+            okx.set_leverage(10, symbol, {'mgnMode': 'cross', 'posSide': 'short'})
         except Exception as e:
             print(f"ℹ️ Leverage: {e}")
 
@@ -285,9 +287,18 @@ def webhook():
         if final_qty <= 0:
             final_qty = min_qty if min_qty else 1
 
+        # ✅ DÜZELTME 2: Hedge mode posSide belirleme
+        pos_side = "long" if side == "buy" else "short"
+
         print(f"🚀 EMİR → {symbol} | {side.upper()} | {final_qty} kontrat | ${allocated_usd}")
 
-        order = okx.create_market_order(symbol=symbol, side=side, amount=final_qty)
+        # ✅ DÜZELTME 3: posSide parametresi eklendi
+        order = okx.create_market_order(
+            symbol=symbol,
+            side=side,
+            amount=final_qty,
+            params={"posSide": pos_side}
+        )
         print(f"✅ İŞLEM AÇILDI! Order ID: {order.get('id', 'N/A')}")
 
         if not position:
