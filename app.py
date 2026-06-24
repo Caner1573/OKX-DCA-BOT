@@ -7,8 +7,8 @@ import math
 
 app = Flask(__name__)
 
-FIXED_API_KEY    = os.environ.get('OKX_API_KEY', '24e933df-c8ab-4511-aba3-2c0e112e3ab1')
-FIXED_SECRET     = os.environ.get('OKX_SECRET',  'EAE744COC9889D243885487D8332D38')
+FIXED_API_KEY    = os.environ.get('OKX_API_KEY', 'e7ef3692-6430-45b5-a882-9a98bf72fe36')
+FIXED_SECRET     = os.environ.get('OKX_SECRET',  'D4BFFD60307F49C84CFB50FB3184CD95')
 FIXED_PASSPHRASE = os.environ.get('OKX_PASS',    'Caner157344...')
 
 def init_db():
