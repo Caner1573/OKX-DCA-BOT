@@ -178,13 +178,18 @@ def webhook():
     except:
         return jsonify({"status": "error", "message": "Gecersiz JSON paketi"}), 400
 
-    symbol = data.get('symbol')
+    raw_symbol = data.get('symbol')
     side = data.get('side', 'buy')
     step = int(data.get('step', 1))
     current_price = float(data.get('price', 0))
 
-    if not symbol or not current_price:
-        return jsonify({"status": "error", "message": "Eksik veri (Symbol veya Price yok)"}), 400
+    if not raw_symbol or not current_price:
+        return jsonify({"status": "error", "message": "Eksik veri"}), 400
+
+    # OKX parite biçimlendirme hatasını düzeltme (.P uzantılarını temizler ve :USDT yapar)
+    symbol = raw_symbol.replace('.P', '').replace('-','').replace('_','')
+    if "USDT" in symbol and not ":" in symbol:
+        symbol = symbol.replace("USDT", "/USDT:USDT")
 
     budgets = {
         1: float(get_setting('l1_usd', 40)),
@@ -220,7 +225,7 @@ def webhook():
         okx.load_markets()
         order_qty = allocated_usd / current_price
         
-        # OKX Piyasasina Göre Alim/Satim Emri Gönderimi
+        # OKX üzerinden emrin gönderilmesi
         order = okx.create_market_order(
             symbol=symbol,
             side=side,
