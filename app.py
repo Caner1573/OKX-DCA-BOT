@@ -9,9 +9,9 @@ import sys
 sys.stdout = sys.stderr
 app = Flask(__name__)
 
-FIXED_API_KEY    = os.environ.get('OKX_API_KEY', 'e7ef3692-6430-45b5-a882-9a98bf72fe36')
-FIXED_SECRET     = os.environ.get('OKX_SECRET',  'D4BFFD60307F49C84CFB50FB3184CD95')
-FIXED_PASSPHRASE = os.environ.get('OKX_PASS',    'Caner157344...')
+FIXED_API_KEY    = os.environ.get('OKX_API_KEY', '733c2c4a-1929-4817-b79a-345cf9deab0a')
+FIXED_SECRET     = os.environ.get('OKX_SECRET',  'CACD00C63057E9AE722A007F00FCF03D')
+FIXED_PASSPHRASE = os.environ.get('OKX_PASS',    'Caner157344.')
 
 def init_db():
     conn = sqlite3.connect('bot_settings.db')
