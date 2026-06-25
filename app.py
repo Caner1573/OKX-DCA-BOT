@@ -22,6 +22,15 @@ RENDER_URL       = os.environ.get('RENDER_URL',      'https://okx-dca-bot.onrend
 TELEGRAM_TOKEN   = os.environ.get('TELEGRAM_TOKEN',  '')
 TELEGRAM_CHAT_ID = os.environ.get('TELEGRAM_CHAT_ID','')
 
+DB_PATH = 'bot_settings.db'
+
+def get_db():
+    """Tüm DB bağlantıları buradan geçer: WAL modu + uzun timeout ile kilitlenme sorununu engeller."""
+    conn = sqlite3.connect(DB_PATH, timeout=20)
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA busy_timeout=20000")
+    return conn
+
 def send_telegram(msg):
     if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
         return
@@ -32,7 +41,7 @@ def send_telegram(msg):
         print(f"⚠️ Telegram hatası: {e}")
 
 def init_db():
-    conn   = sqlite3.connect('bot_settings.db')
+    conn   = get_db()
     cursor = conn.cursor()
     cursor.execute('CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT)')
     cursor.execute('''
@@ -85,14 +94,14 @@ def init_db():
     conn.close()
 
 def save_setting(key, value):
-    conn = sqlite3.connect('bot_settings.db')
+    conn = get_db()
     cursor = conn.cursor()
     cursor.execute("INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)", (key, str(value)))
     conn.commit()
     conn.close()
 
 def get_setting(key, default):
-    conn = sqlite3.connect('bot_settings.db')
+    conn = get_db()
     cursor = conn.cursor()
     cursor.execute("SELECT value FROM settings WHERE key=?", (key,))
     row = cursor.fetchone()
@@ -103,7 +112,7 @@ def get_setting(key, default):
     return val
 
 def get_stats():
-    conn = sqlite3.connect('bot_settings.db')
+    conn = get_db()
     cursor = conn.cursor()
     try:
         cursor.execute("SELECT COUNT(*), SUM(CASE WHEN pnl > 0 THEN 1 ELSE 0 END), SUM(pnl) FROM trades")
@@ -119,7 +128,7 @@ def get_stats():
     return total, win_rate, total_pnl
 
 def get_daily_stats():
-    conn = sqlite3.connect('bot_settings.db')
+    conn = get_db()
     cursor = conn.cursor()
     today = datetime.now().strftime('%Y-%m-%d')
     try:
@@ -148,7 +157,7 @@ def get_pnl_analytics(range_key):
     24h -> saatlik noktalar (son 24 saat)
     diğerleri -> günlük satırlar (tarih, işlem sayısı, kazanan, kaybeden, pnl, kümülatif)
     """
-    conn = sqlite3.connect('bot_settings.db')
+    conn = get_db()
     cursor = conn.cursor()
 
     range_days_map = {
@@ -310,6 +319,17 @@ def get_okx_positions():
         print(f"⚠️ OKX pozisyon çekme hatası: {e}")
         return {}
 
+def get_okx_position_for_symbol(okx, symbol):
+    """Belirli bir sembol için OKX'teki gerçek pozisyonu döndürür (varsa), yoksa None."""
+    try:
+        positions = okx.fetch_positions([symbol])
+        for p in positions:
+            if p and float(p.get('contracts', 0) or 0) > 0:
+                return p
+    except Exception as e:
+        print(f"⚠️ OKX pozisyon kontrol hatası {symbol}: {e}")
+    return None
+
 def get_previous_day_hl(okx, symbol):
     try:
         ohlcv = okx.fetch_ohlcv(symbol, timeframe='1d', limit=2)
@@ -372,7 +392,7 @@ def record_pnl_snapshot():
     while True:
         try:
             time.sleep(3600)
-            conn   = sqlite3.connect('bot_settings.db')
+            conn   = get_db()
             cursor = conn.cursor()
             cursor.execute("SELECT SUM(pnl) FROM trades")
             row       = cursor.fetchone()
@@ -384,10 +404,43 @@ def record_pnl_snapshot():
         except Exception as e:
             print(f"⚠️ PnL snapshot hatası: {e}")
 
+def close_full_position_in_db(symbol, side, status, pnl_usd):
+    """
+    Bir pozisyonu trades tablosuna kaydeder ve active_positions'tan siler.
+    Başarılı olursa True, DB hatası olursa False döner (asla sessiz geçmez).
+    """
+    try:
+        conn2 = get_db()
+        cur2  = conn2.cursor()
+        cur2.execute("INSERT INTO trades (symbol,side,status,pnl,closed_at) VALUES (?,?,?,?,?)",
+                     (symbol, side, status, round(pnl_usd, 2), datetime.now().strftime('%Y-%m-%d %H:%M')))
+        cur2.execute("DELETE FROM active_positions WHERE symbol=?", (symbol,))
+        conn2.commit()
+        conn2.close()
+        return True
+    except Exception as e:
+        print(f"❌ DB GÜNCELLEME HATASI ({symbol}, {status}): {e}")
+        return False
+
+def update_partial_position_in_db(symbol, **fields):
+    """active_positions tablosunda kısmi güncelleme (TP1 sonrası kalan miktar gibi)."""
+    try:
+        conn2 = get_db()
+        cur2  = conn2.cursor()
+        set_clause = ", ".join(f"{k}=?" for k in fields.keys())
+        values = list(fields.values()) + [symbol]
+        cur2.execute(f"UPDATE active_positions SET {set_clause} WHERE symbol=?", values)
+        conn2.commit()
+        conn2.close()
+        return True
+    except Exception as e:
+        print(f"❌ DB GÜNCELLEME HATASI (partial, {symbol}): {e}")
+        return False
+
 def tp_monitor():
     while True:
         try:
-            conn   = sqlite3.connect('bot_settings.db')
+            conn   = get_db()
             cursor = conn.cursor()
             cursor.execute("SELECT symbol, side, avg_entry_price, total_contracts, tp1_done, tp2_done, sl_active FROM active_positions")
             positions = cursor.fetchall()
@@ -405,17 +458,18 @@ def tp_monitor():
                         continue
                     okx.load_markets()
 
-                    okx_positions = okx.fetch_positions([symbol])
-                    cur_price     = None
-                    real_pnl_usd  = None
-                    real_pnl_pct  = None
+                    # OKX'te bu sembol için gerçekten açık pozisyon var mı? (manuel kapatılmış olabilir)
+                    real_pos = get_okx_position_for_symbol(okx, symbol)
+                    if not real_pos:
+                        # Borsada pozisyon yok ama DB'de hâlâ "açık" görünüyor demek ki manuel/başka yoldan
+                        # kapanmış ve DB güncellenememiş. DB'yi senkronize et, sessizce kayıp PnL bırakma.
+                        print(f"ℹ️ {symbol} borsada bulunamadı, DB'den temizleniyor (muhtemelen manuel kapatılmış)")
+                        close_full_position_in_db(symbol, side, 'MANUEL_SENKRON', 0.0)
+                        continue
 
-                    for p in okx_positions:
-                        if p and float(p.get('contracts', 0) or 0) > 0:
-                            cur_price    = float(p.get('markPrice', 0) or 0)
-                            real_pnl_usd = float(p.get('unrealizedPnl', 0) or 0)
-                            real_pnl_pct = float(p.get('percentage', 0) or 0)
-                            break
+                    cur_price    = float(real_pos.get('markPrice', 0) or 0)
+                    real_pnl_usd = float(real_pos.get('unrealizedPnl', 0) or 0)
+                    real_pnl_pct = float(real_pos.get('percentage', 0) or 0)
 
                     if not cur_price:
                         ticker    = okx.fetch_ticker(symbol)
@@ -424,7 +478,6 @@ def tp_monitor():
                     tp1_pct = float(get_setting('tp1_pct', 1.5)) / 100
                     tp2_pct = float(get_setting('tp2_pct', 3.0)) / 100
                     tp1_qty = float(get_setting('tp1_qty', 50)) / 100
-                    tp2_qty = float(get_setting('tp2_qty', 50)) / 100
 
                     if side == 'buy':
                         tp1_price = avg_price * (1 + tp1_pct)
@@ -446,60 +499,54 @@ def tp_monitor():
 
                     print(f"👁 {symbol} | Fiyat:{cur_price} | Ort:{avg_price:.4f} | PnL:{pnl_usd:.2f} | SL_Aktif:{bool(sl_active)}")
 
+                    # --- SL (BREAKEVEN) ---
                     if hit_sl and not tp2_done:
                         okx.create_market_order(
                             symbol=symbol, side=close_side, amount=total_contracts,
                             params={"posSide": pos_side, "reduceOnly": True}
                         )
                         sym_short = symbol.replace('/USDT:USDT', '')
-                        send_telegram(
-                            f"🛡 <b>SL (Breakeven) Tetiklendi!</b>\n"
-                            f"Sembol: <b>{sym_short}</b>\n"
-                            f"Yön: {'LONG' if side=='buy' else 'SHORT'}\n"
-                            f"Fiyat: ${cur_price:.4f}\n"
-                            f"Entry: ${avg_price:.4f}\n"
-                            f"PnL: ~$0 (Breakeven koruması)"
-                        )
-                        conn2 = sqlite3.connect('bot_settings.db')
-                        cur2  = conn2.cursor()
-                        cur2.execute("INSERT INTO trades (symbol,side,status,pnl,closed_at) VALUES (?,?,?,?,?)",
-                                     (symbol, side, 'SL_BREAKEVEN', round(pnl_usd, 2), datetime.now().strftime('%Y-%m-%d %H:%M')))
-                        cur2.execute("DELETE FROM active_positions WHERE symbol=?", (symbol,))
-                        conn2.commit()
-                        conn2.close()
+                        ok = close_full_position_in_db(symbol, side, 'SL_BREAKEVEN', pnl_usd)
+                        if ok:
+                            send_telegram(
+                                f"🛡 <b>SL (Breakeven) Tetiklendi!</b>\n"
+                                f"Sembol: <b>{sym_short}</b>\n"
+                                f"Yön: {'LONG' if side=='buy' else 'SHORT'}\n"
+                                f"Fiyat: ${cur_price:.4f}\n"
+                                f"Entry: ${avg_price:.4f}\n"
+                                f"PnL: ~${pnl_usd:.2f}"
+                            )
+                        else:
+                            send_telegram(f"⚠️ {sym_short} SL'de kapandı ama panel kaydı başarısız oldu, kontrol edin!")
                         continue
 
+                    # --- TP2: kalan pozisyonun TAMAMI kapanır ---
                     if hit_tp2 and not tp2_done:
-                        qty = math.floor(total_contracts * tp2_qty * 10) / 10
-                        if qty <= 0:
-                            qty = total_contracts
+                        qty = total_contracts  # kalan = TP2 payının tamamı, yüzde uygulanmaz
                         okx.create_market_order(
                             symbol=symbol, side=close_side, amount=qty,
                             params={"posSide": pos_side, "reduceOnly": True}
                         )
                         sym_short = symbol.replace('/USDT:USDT', '')
-                        send_telegram(
-                            f"✅ <b>TP2 HIT!</b>\n"
-                            f"Sembol: <b>{sym_short}</b>\n"
-                            f"Yön: {'LONG' if side=='buy' else 'SHORT'}\n"
-                            f"Fiyat: ${cur_price:.4f}\n"
-                            f"PnL: +${pnl_usd:.2f} USDT (+{pnl_pct_val:.2f}%)"
-                        )
-                        conn2 = sqlite3.connect('bot_settings.db')
-                        cur2  = conn2.cursor()
-                        remaining = max(0, total_contracts - qty)
-                        if remaining <= 0:
-                            cur2.execute("INSERT INTO trades (symbol,side,status,pnl,closed_at) VALUES (?,?,?,?,?)",
-                                         (symbol, side, 'TP2', round(pnl_usd, 2), datetime.now().strftime('%Y-%m-%d %H:%M')))
-                            cur2.execute("DELETE FROM active_positions WHERE symbol=?", (symbol,))
+                        ok = close_full_position_in_db(symbol, side, 'TP2', pnl_usd)
+                        if ok:
+                            send_telegram(
+                                f"✅ <b>TP2 HIT! Pozisyon tamamen kapandı</b>\n"
+                                f"Sembol: <b>{sym_short}</b>\n"
+                                f"Yön: {'LONG' if side=='buy' else 'SHORT'}\n"
+                                f"Fiyat: ${cur_price:.4f}\n"
+                                f"PnL: +${pnl_usd:.2f} USDT (+{pnl_pct_val:.2f}%)"
+                            )
                         else:
-                            cur2.execute("UPDATE active_positions SET tp2_done=1, total_contracts=? WHERE symbol=?",
-                                         (remaining, symbol))
-                        conn2.commit()
-                        conn2.close()
+                            send_telegram(f"⚠️ {sym_short} TP2'de kapandı ama panel kaydı başarısız oldu, kontrol edin!")
+                        continue
 
-                    elif hit_tp1 and not tp1_done:
+                    # --- TP1: kısmi kapama + breakeven SL aktif et ---
+                    if hit_tp1 and not tp1_done:
                         qty = math.floor(total_contracts * tp1_qty * 10) / 10
+                        if qty <= 0 or qty >= total_contracts:
+                            qty = total_contracts * 0.5  # güvenlik: yanlış hesapta tüm pozisyonu kapatmasın
+                            qty = math.floor(qty * 10) / 10
                         if qty <= 0:
                             qty = total_contracts
                         okx.create_market_order(
@@ -507,23 +554,22 @@ def tp_monitor():
                             params={"posSide": pos_side, "reduceOnly": True}
                         )
                         sym_short = symbol.replace('/USDT:USDT', '')
-                        send_telegram(
-                            f"🎯 <b>TP1 HIT!</b>\n"
-                            f"Sembol: <b>{sym_short}</b>\n"
-                            f"Yön: {'LONG' if side=='buy' else 'SHORT'}\n"
-                            f"Fiyat: ${cur_price:.4f}\n"
-                            f"PnL: +${pnl_usd:.2f} USDT (+{pnl_pct_val:.2f}%)\n"
-                            f"🛡 SL Breakeven aktif @ ${avg_price:.4f}"
+                        remaining = max(0, round(total_contracts - qty, 6))
+                        ok = update_partial_position_in_db(
+                            symbol, tp1_done=1, sl_active=1, total_contracts=remaining
                         )
-                        conn2 = sqlite3.connect('bot_settings.db')
-                        cur2  = conn2.cursor()
-                        remaining = max(0, total_contracts - qty)
-                        cur2.execute(
-                            "UPDATE active_positions SET tp1_done=1, sl_active=1, total_contracts=? WHERE symbol=?",
-                            (remaining, symbol)
-                        )
-                        conn2.commit()
-                        conn2.close()
+                        if ok:
+                            send_telegram(
+                                f"🎯 <b>TP1 HIT!</b>\n"
+                                f"Sembol: <b>{sym_short}</b>\n"
+                                f"Yön: {'LONG' if side=='buy' else 'SHORT'}\n"
+                                f"Fiyat: ${cur_price:.4f}\n"
+                                f"PnL: +${pnl_usd:.2f} USDT (+{pnl_pct_val:.2f}%)\n"
+                                f"Kalan pozisyon TP2'de tamamen kapanacak\n"
+                                f"🛡 SL Breakeven aktif @ ${avg_price:.4f}"
+                            )
+                        else:
+                            send_telegram(f"⚠️ {sym_short} TP1'de kapandı ama panel kaydı başarısız oldu, kontrol edin!")
 
                 except Exception as e:
                     print(f"⚠️ TP kontrol hatası {symbol}: {e}")
@@ -542,7 +588,7 @@ def dashboard_data():
     total, win_rate, total_pnl = get_stats()
     acilan, kapanan, acik, tp1, tp2, sl, tp2_bekliyor = get_daily_stats()
 
-    conn = sqlite3.connect('bot_settings.db')
+    conn = get_db()
     cursor = conn.cursor()
     cursor.execute("SELECT symbol, side, avg_entry_price, total_contracts, current_step, tp1_done, tp2_done, sl_active FROM active_positions")
     active_pos = cursor.fetchall()
@@ -551,9 +597,15 @@ def dashboard_data():
     okx_pos = get_okx_positions()
 
     positions = []
+    stale_symbols = []
     for p in active_pos:
         symbol, side, avg_price, contracts, step, tp1_done, tp2_done, sl_active = p
         okx = okx_pos.get(symbol, {})
+
+        if not okx:
+            # Borsada karşılığı yok -> manuel kapatılmış ama DB'den silinememiş demektir.
+            stale_symbols.append(symbol)
+            continue
 
         real_entry   = okx.get('entryPrice', avg_price) or avg_price
         real_mark    = okx.get('markPrice',  avg_price) or avg_price
@@ -576,6 +628,13 @@ def dashboard_data():
             "slActive":  bool(sl_active),
             "slPrice":   real_entry,
         })
+
+    # Borsada artık olmayan ama DB'de kalmış pozisyonları burada da temizle
+    # (panel her açıldığında ekstra bir güvenlik katmanı, tp_monitor'u 10sn beklemeden)
+    if stale_symbols:
+        for sym in stale_symbols:
+            print(f"ℹ️ Panel: {sym} borsada yok, DB temizleniyor")
+            close_full_position_in_db(sym, '', 'MANUEL_SENKRON', 0.0)
 
     return jsonify({
         "total":        total,
@@ -618,7 +677,6 @@ def dashboard():
         'tp1_pct':    get_setting('tp1_pct',  '1.5'),
         'tp1_qty':    get_setting('tp1_qty',  '50'),
         'tp2_pct':    get_setting('tp2_pct',  '3.0'),
-        'tp2_qty':    get_setting('tp2_qty',  '50'),
         'tg_token':   get_setting('tg_token', ''),
         'tg_chat_id': get_setting('tg_chat_id', ''),
     }
@@ -685,8 +743,8 @@ input:focus{outline:none;border-color:#4caf50}
 .daily-row:last-child{border-bottom:none}
 .daily-label{font-size:12px;color:#666}
 .daily-val{font-size:18px;font-weight:700}
+.note{font-size:0.66rem;color:#555;margin-top:8px;line-height:1.4}
 
-/* ---- PNL ANALİTİK PANELİ ---- */
 .range-select{position:relative}
 .range-select select{
   background:#0d0d0f;border:1px solid #2a2a2e;color:#e0e0e0;font-size:0.68rem;
@@ -847,9 +905,9 @@ input:focus{outline:none;border-color:#4caf50}
   <label>Min. Fibo Mesafesi (%) — İlk girişte kontrol edilir</label>
   <input type="number" step="0.1" name="min_dist" value="{{ min_dist }}">
   <label>TP1 Oranı (%)</label><input type="number" step="0.1" name="tp1_pct" value="{{ tp1_pct }}">
-  <label>TP1 Satış (%)</label><input type="number" name="tp1_qty" value="{{ tp1_qty }}">
+  <label>TP1 Satış (%) — kalanın tamamı TP2'de kapanır</label><input type="number" name="tp1_qty" value="{{ tp1_qty }}">
   <label>TP2 Oranı (%)</label><input type="number" step="0.1" name="tp2_pct" value="{{ tp2_pct }}">
-  <label>TP2 Satış (%)</label><input type="number" name="tp2_qty" value="{{ tp2_qty }}">
+  <div class="note">ℹ️ TP2 tetiklendiğinde kalan pozisyonun tamamı kapanır — bu davranış artık sabit, ayrıca bir "TP2 satış %" girilmiyor.</div>
 </div>
 <div class="card">
   <h2>📱 Telegram Bildirimleri</h2>
@@ -940,7 +998,6 @@ function winRateClass(wr){
 }
 
 function renderPnlAnalytics(data){
-  // özet kartlar
   const totalEl = document.getElementById('pa-total');
   totalEl.textContent = fmtU(data.total_pnl);
   totalEl.className = 'val ' + (data.total_pnl >= 0 ? 'pos-val' : 'neg-val');
@@ -964,7 +1021,6 @@ function renderPnlAnalytics(data){
     document.getElementById('pa-worst-sub').textContent = 'veri yok';
   }
 
-  // tablo
   const tbody = document.getElementById('paTblBody');
   if(!data.rows.length){
     tbody.innerHTML = '<tr><td colspan="6" class="no-pos">Bu aralıkta kapanmış işlem yok</td></tr>';
@@ -996,7 +1052,6 @@ function renderPnlAnalytics(data){
     tbody.innerHTML = html;
   }
 
-  // grafik
   const ctx = document.getElementById('cumChart');
   const gradient = ctx.getContext('2d').createLinearGradient(0,0,0,200);
   const isOverallPos = data.total_pnl >= 0;
@@ -1183,7 +1238,7 @@ def close_position():
         return jsonify({"status": "error", "message": "API bağlantısı yok"}), 200
     try:
         okx.load_markets()
-        conn   = sqlite3.connect('bot_settings.db')
+        conn   = get_db()
         cursor = conn.cursor()
         cursor.execute("SELECT total_contracts, avg_entry_price FROM active_positions WHERE symbol=?", (symbol,))
         row = cursor.fetchone()
@@ -1204,28 +1259,37 @@ def close_position():
                 real_pnl_usd = float(p.get('unrealizedPnl', 0) or 0)
                 real_pnl_pct = float(p.get('percentage', 0) or 0)
                 break
-        if not cur_price:
+
+        # OKX'te zaten kapalıysa (kullanıcı borsadan elle kapatmış olabilir) -> sadece DB'yi temizle
+        if cur_price is None:
             ticker    = okx.fetch_ticker(symbol)
             cur_price = ticker['last']
+            ok = close_full_position_in_db(symbol, side, 'MANUEL_SENKRON', 0.0)
+            if ok:
+                return jsonify({"status": "success", "message": f"{symbol.replace('/USDT:USDT','')} borsada zaten kapalıydı, panel senkronize edildi"}), 200
+            else:
+                return jsonify({"status": "error", "message": "Borsada pozisyon yok ama panel güncellenemedi (DB hatası), tekrar deneyin"}), 200
 
         okx.create_market_order(
             symbol=symbol, side=close_side, amount=total_contracts,
             params={"posSide": pos_side, "reduceOnly": True}
         )
         sym_short = symbol.replace('/USDT:USDT', '')
+
+        ok = close_full_position_in_db(symbol, side, 'MANUEL', real_pnl_usd)
+        if not ok:
+            # OKX'te kapandı ama DB güncellenemedi -> kullanıcıyı net şekilde uyar, sessiz kalma
+            return jsonify({
+                "status": "error",
+                "message": f"{sym_short} borsada kapatıldı (PnL: ${real_pnl_usd:.2f}) AMA panel güncellenemedi! Sayfayı yenileyip tekrar dener misin?"
+            }), 200
+
         send_telegram(
             f"🛑 <b>Manuel Kapatma</b>\n"
             f"Sembol: <b>{sym_short}</b>\n"
             f"Fiyat: ${cur_price:.4f}\n"
             f"PnL: {'+' if real_pnl_usd>=0 else ''}${real_pnl_usd:.2f} USDT ({fmt_pct(real_pnl_pct)}%)"
         )
-        conn2  = sqlite3.connect('bot_settings.db')
-        cur2   = conn2.cursor()
-        cur2.execute("INSERT INTO trades (symbol,side,status,pnl,closed_at) VALUES (?,?,?,?,?)",
-                     (symbol, side, 'MANUEL', round(real_pnl_usd, 2), datetime.now().strftime('%Y-%m-%d %H:%M')))
-        cur2.execute("DELETE FROM active_positions WHERE symbol=?", (symbol,))
-        conn2.commit()
-        conn2.close()
         return jsonify({"status": "success", "message": f"{sym_short} kapatıldı | PnL: ${real_pnl_usd:.2f}"}), 200
     except Exception as e:
         return jsonify({"status": "error", "message": str(e)}), 200
@@ -1300,7 +1364,7 @@ def webhook():
         except Exception as e:
             print(f"⚠️ Fibo kontrol hatası, devam ediliyor: {e}")
 
-    conn   = sqlite3.connect('bot_settings.db')
+    conn   = get_db()
     cursor = conn.cursor()
     cursor.execute("SELECT side, last_entry_price, current_step, avg_entry_price, total_contracts FROM active_positions WHERE symbol=?", (symbol,))
     position = cursor.fetchone()
