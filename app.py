@@ -83,6 +83,7 @@ def init_db():
         ('tp1_done',        'INTEGER DEFAULT 0'),
         ('tp2_done',        'INTEGER DEFAULT 0'),
         ('sl_active',       'INTEGER DEFAULT 0'),
+        ('realized_pnl',    'REAL DEFAULT 0'),
     ]:
         if col not in existing:
             cursor.execute(f"ALTER TABLE active_positions ADD COLUMN {col} {definition}")
@@ -423,7 +424,7 @@ def close_full_position_in_db(symbol, side, status, pnl_usd):
         return False
 
 def update_partial_position_in_db(symbol, **fields):
-    """active_positions tablosunda kısmi güncelleme (TP1 sonrası kalan miktar gibi)."""
+    """active_positions tablosunda kısmi güncelleme (TP1 sonrası kalan miktar ve gerçekleşen kâr gibi)."""
     try:
         conn2 = get_db()
         cur2  = conn2.cursor()
@@ -442,12 +443,12 @@ def tp_monitor():
         try:
             conn   = get_db()
             cursor = conn.cursor()
-            cursor.execute("SELECT symbol, side, avg_entry_price, total_contracts, tp1_done, tp2_done, sl_active FROM active_positions")
+            cursor.execute("SELECT symbol, side, avg_entry_price, total_contracts, tp1_done, tp2_done, sl_active, realized_pnl FROM active_positions")
             positions = cursor.fetchall()
             conn.close()
 
             for pos in positions:
-                symbol, side, avg_price, total_contracts, tp1_done, tp2_done, sl_active = pos
+                symbol, side, avg_price, total_contracts, tp1_done, tp2_done, sl_active, realized_pnl = pos
                 if not avg_price or avg_price == 0:
                     continue
                 if not total_contracts or total_contracts == 0:
@@ -464,7 +465,10 @@ def tp_monitor():
                         # Borsada pozisyon yok ama DB'de hâlâ "açık" görünüyor demek ki manuel/başka yoldan
                         # kapanmış ve DB güncellenememiş. DB'yi senkronize et, sessizce kayıp PnL bırakma.
                         print(f"ℹ️ {symbol} borsada bulunamadı, DB'den temizleniyor (muhtemelen manuel kapatılmış)")
-                        close_full_position_in_db(symbol, side, 'MANUEL_SENKRON', 0.0)
+                        # TP1 sonrası gelen manuel kapamada da realized_pnl'i koru
+                        fallback_pnl = realized_pnl or 0.0
+                        status = 'SL_BREAKEVEN' if tp1_done else 'MANUEL_SENKRON'
+                        close_full_position_in_db(symbol, side, status, fallback_pnl)
                         continue
 
                     cur_price    = float(real_pos.get('markPrice', 0) or 0)
@@ -497,16 +501,19 @@ def tp_monitor():
                     pnl_usd     = real_pnl_usd if real_pnl_usd is not None else 0
                     pnl_pct_val = real_pnl_pct if real_pnl_pct is not None else 0
 
-                    print(f"👁 {symbol} | Fiyat:{cur_price} | Ort:{avg_price:.4f} | PnL:{pnl_usd:.2f} | SL_Aktif:{bool(sl_active)}")
+                    print(f"👁 {symbol} | Fiyat:{cur_price} | Ort:{avg_price:.4f} | PnL:{pnl_usd:.2f} | SL_Aktif:{bool(sl_active)} | Birikmiş:{realized_pnl or 0:.2f}")
 
-                    # --- SL (BREAKEVEN) ---
+                    # --- SL (BREAKEVEN): TP1 sonrası geldiği için her zaman WIN sayılır ---
                     if hit_sl and not tp2_done:
                         okx.create_market_order(
                             symbol=symbol, side=close_side, amount=total_contracts,
                             params={"posSide": pos_side, "reduceOnly": True}
                         )
                         sym_short = symbol.replace('/USDT:USDT', '')
-                        ok = close_full_position_in_db(symbol, side, 'SL_BREAKEVEN', pnl_usd)
+                        total_realized = (realized_pnl or 0) + pnl_usd
+                        # TP1 kârı gerçekleşmiş olduğu için bu satış WIN olarak işaretlenir (en az +0.01)
+                        final_pnl = total_realized if total_realized > 0 else 0.01
+                        ok = close_full_position_in_db(symbol, side, 'SL_BREAKEVEN', final_pnl)
                         if ok:
                             send_telegram(
                                 f"🛡 <b>SL (Breakeven) Tetiklendi!</b>\n"
@@ -514,7 +521,7 @@ def tp_monitor():
                                 f"Yön: {'LONG' if side=='buy' else 'SHORT'}\n"
                                 f"Fiyat: ${cur_price:.4f}\n"
                                 f"Entry: ${avg_price:.4f}\n"
-                                f"PnL: ~${pnl_usd:.2f}"
+                                f"Toplam PnL: +${final_pnl:.2f} (TP1 kârı korundu)"
                             )
                         else:
                             send_telegram(f"⚠️ {sym_short} SL'de kapandı ama panel kaydı başarısız oldu, kontrol edin!")
@@ -528,27 +535,33 @@ def tp_monitor():
                             params={"posSide": pos_side, "reduceOnly": True}
                         )
                         sym_short = symbol.replace('/USDT:USDT', '')
-                        ok = close_full_position_in_db(symbol, side, 'TP2', pnl_usd)
+                        total_realized = (realized_pnl or 0) + pnl_usd
+                        ok = close_full_position_in_db(symbol, side, 'TP2', total_realized)
                         if ok:
                             send_telegram(
                                 f"✅ <b>TP2 HIT! Pozisyon tamamen kapandı</b>\n"
                                 f"Sembol: <b>{sym_short}</b>\n"
                                 f"Yön: {'LONG' if side=='buy' else 'SHORT'}\n"
                                 f"Fiyat: ${cur_price:.4f}\n"
-                                f"PnL: +${pnl_usd:.2f} USDT (+{pnl_pct_val:.2f}%)"
+                                f"Toplam PnL: +${total_realized:.2f} USDT"
                             )
                         else:
                             send_telegram(f"⚠️ {sym_short} TP2'de kapandı ama panel kaydı başarısız oldu, kontrol edin!")
                         continue
 
-                    # --- TP1: kısmi kapama + breakeven SL aktif et ---
-                    if hit_tp1 and not tp1_done:
+                    # --- TP1: kısmi kapama + breakeven SL aktif et + gerçekleşen kârı biriktir ---
+                    elif hit_tp1 and not tp1_done:
                         qty = math.floor(total_contracts * tp1_qty * 10) / 10
                         if qty <= 0 or qty >= total_contracts:
-                            qty = total_contracts * 0.5  # güvenlik: yanlış hesapta tüm pozisyonu kapatmasın
+                            qty = total_contracts * 0.5
                             qty = math.floor(qty * 10) / 10
                         if qty <= 0:
                             qty = total_contracts
+
+                        # TP1'de kapanan dilimin gerçekleşen kârını oransal hesapla
+                        portion      = qty / total_contracts if total_contracts else 0
+                        tp1_realized = pnl_usd * portion
+
                         okx.create_market_order(
                             symbol=symbol, side=close_side, amount=qty,
                             params={"posSide": pos_side, "reduceOnly": True}
@@ -556,7 +569,8 @@ def tp_monitor():
                         sym_short = symbol.replace('/USDT:USDT', '')
                         remaining = max(0, round(total_contracts - qty, 6))
                         ok = update_partial_position_in_db(
-                            symbol, tp1_done=1, sl_active=1, total_contracts=remaining
+                            symbol, tp1_done=1, sl_active=1,
+                            total_contracts=remaining, realized_pnl=tp1_realized
                         )
                         if ok:
                             send_telegram(
@@ -564,7 +578,7 @@ def tp_monitor():
                                 f"Sembol: <b>{sym_short}</b>\n"
                                 f"Yön: {'LONG' if side=='buy' else 'SHORT'}\n"
                                 f"Fiyat: ${cur_price:.4f}\n"
-                                f"PnL: +${pnl_usd:.2f} USDT (+{pnl_pct_val:.2f}%)\n"
+                                f"Gerçekleşen kâr: +${tp1_realized:.2f} USDT\n"
                                 f"Kalan pozisyon TP2'de tamamen kapanacak\n"
                                 f"🛡 SL Breakeven aktif @ ${avg_price:.4f}"
                             )
@@ -604,7 +618,7 @@ def dashboard_data():
 
         if not okx:
             # Borsada karşılığı yok -> manuel kapatılmış ama DB'den silinememiş demektir.
-            stale_symbols.append(symbol)
+            stale_symbols.append((symbol, side, bool(tp1_done)))
             continue
 
         real_entry   = okx.get('entryPrice', avg_price) or avg_price
@@ -632,9 +646,16 @@ def dashboard_data():
     # Borsada artık olmayan ama DB'de kalmış pozisyonları burada da temizle
     # (panel her açıldığında ekstra bir güvenlik katmanı, tp_monitor'u 10sn beklemeden)
     if stale_symbols:
-        for sym in stale_symbols:
-            print(f"ℹ️ Panel: {sym} borsada yok, DB temizleniyor")
-            close_full_position_in_db(sym, '', 'MANUEL_SENKRON', 0.0)
+        conn3 = get_db()
+        cur3  = conn3.cursor()
+        for sym, sd, had_tp1 in stale_symbols:
+            cur3.execute("SELECT realized_pnl FROM active_positions WHERE symbol=?", (sym,))
+            r = cur3.fetchone()
+            fallback_pnl = (r[0] if r and r[0] else 0.0)
+            status = 'SL_BREAKEVEN' if had_tp1 else 'MANUEL_SENKRON'
+            print(f"ℹ️ Panel: {sym} borsada yok, DB temizleniyor ({status})")
+            close_full_position_in_db(sym, sd, status, fallback_pnl)
+        conn3.close()
 
     return jsonify({
         "total":        total,
@@ -907,7 +928,7 @@ input:focus{outline:none;border-color:#4caf50}
   <label>TP1 Oranı (%)</label><input type="number" step="0.1" name="tp1_pct" value="{{ tp1_pct }}">
   <label>TP1 Satış (%) — kalanın tamamı TP2'de kapanır</label><input type="number" name="tp1_qty" value="{{ tp1_qty }}">
   <label>TP2 Oranı (%)</label><input type="number" step="0.1" name="tp2_pct" value="{{ tp2_pct }}">
-  <div class="note">ℹ️ TP2 tetiklendiğinde kalan pozisyonun tamamı kapanır — bu davranış artık sabit, ayrıca bir "TP2 satış %" girilmiyor.</div>
+  <div class="note">ℹ️ TP2 tetiklendiğinde kalan pozisyonun tamamı kapanır. TP1 sonrası gelen breakeven SL de artık TP1'de gerçekleşen kârı koruyarak WIN olarak sayılır.</div>
 </div>
 <div class="card">
   <h2>📱 Telegram Bildirimleri</h2>
@@ -1240,12 +1261,12 @@ def close_position():
         okx.load_markets()
         conn   = get_db()
         cursor = conn.cursor()
-        cursor.execute("SELECT total_contracts, avg_entry_price FROM active_positions WHERE symbol=?", (symbol,))
+        cursor.execute("SELECT total_contracts, avg_entry_price, tp1_done, realized_pnl FROM active_positions WHERE symbol=?", (symbol,))
         row = cursor.fetchone()
         conn.close()
         if not row or not row[0]:
             return jsonify({"status": "error", "message": "Pozisyon bulunamadı"}), 200
-        total_contracts, avg_price = row
+        total_contracts, avg_price, tp1_done, realized_pnl = row
         close_side  = 'sell' if side == 'buy' else 'buy'
         pos_side    = 'long' if side == 'buy' else 'short'
 
@@ -1264,7 +1285,9 @@ def close_position():
         if cur_price is None:
             ticker    = okx.fetch_ticker(symbol)
             cur_price = ticker['last']
-            ok = close_full_position_in_db(symbol, side, 'MANUEL_SENKRON', 0.0)
+            fallback_pnl = realized_pnl or 0.0
+            status = 'SL_BREAKEVEN' if tp1_done else 'MANUEL_SENKRON'
+            ok = close_full_position_in_db(symbol, side, status, fallback_pnl)
             if ok:
                 return jsonify({"status": "success", "message": f"{symbol.replace('/USDT:USDT','')} borsada zaten kapalıydı, panel senkronize edildi"}), 200
             else:
@@ -1276,21 +1299,27 @@ def close_position():
         )
         sym_short = symbol.replace('/USDT:USDT', '')
 
-        ok = close_full_position_in_db(symbol, side, 'MANUEL', real_pnl_usd)
+        # TP1 sonrası gelen manuel kapamada da biriken kâr dahil edilir, win/lose doğru hesaplanır
+        total_realized = (realized_pnl or 0) + real_pnl_usd
+        status = 'SL_BREAKEVEN' if tp1_done else 'MANUEL'
+        if tp1_done and total_realized <= 0:
+            total_realized = 0.01  # TP1 kârı gerçekleşmiş, win sayılmalı
+
+        ok = close_full_position_in_db(symbol, side, status, total_realized)
         if not ok:
             # OKX'te kapandı ama DB güncellenemedi -> kullanıcıyı net şekilde uyar, sessiz kalma
             return jsonify({
                 "status": "error",
-                "message": f"{sym_short} borsada kapatıldı (PnL: ${real_pnl_usd:.2f}) AMA panel güncellenemedi! Sayfayı yenileyip tekrar dener misin?"
+                "message": f"{sym_short} borsada kapatıldı (PnL: ${total_realized:.2f}) AMA panel güncellenemedi! Sayfayı yenileyip tekrar dener misin?"
             }), 200
 
         send_telegram(
             f"🛑 <b>Manuel Kapatma</b>\n"
             f"Sembol: <b>{sym_short}</b>\n"
             f"Fiyat: ${cur_price:.4f}\n"
-            f"PnL: {'+' if real_pnl_usd>=0 else ''}${real_pnl_usd:.2f} USDT ({fmt_pct(real_pnl_pct)}%)"
+            f"Toplam PnL: {'+' if total_realized>=0 else ''}${total_realized:.2f} USDT"
         )
-        return jsonify({"status": "success", "message": f"{sym_short} kapatıldı | PnL: ${real_pnl_usd:.2f}"}), 200
+        return jsonify({"status": "success", "message": f"{sym_short} kapatıldı | PnL: ${total_realized:.2f}"}), 200
     except Exception as e:
         return jsonify({"status": "error", "message": str(e)}), 200
 
