@@ -118,6 +118,30 @@ def get_stats():
         conn.close()
     return total, win_rate, total_pnl
 
+def get_daily_stats():
+    conn = sqlite3.connect('bot_settings.db')
+    cursor = conn.cursor()
+    today = datetime.now().strftime('%Y-%m-%d')
+    try:
+        cursor.execute("SELECT COUNT(*) FROM trades WHERE closed_at LIKE ?", (today + '%',))
+        kapanan = cursor.fetchone()[0] or 0
+        cursor.execute("SELECT COUNT(*) FROM trades WHERE status='TP1' AND closed_at LIKE ?", (today + '%',))
+        tp1 = cursor.fetchone()[0] or 0
+        cursor.execute("SELECT COUNT(*) FROM trades WHERE status='TP2' AND closed_at LIKE ?", (today + '%',))
+        tp2 = cursor.fetchone()[0] or 0
+        cursor.execute("SELECT COUNT(*) FROM trades WHERE status='SL_BREAKEVEN' AND closed_at LIKE ?", (today + '%',))
+        sl = cursor.fetchone()[0] or 0
+        cursor.execute("SELECT COUNT(*) FROM active_positions WHERE tp1_done=1 AND tp2_done=0")
+        tp2_bekliyor = cursor.fetchone()[0] or 0
+        cursor.execute("SELECT COUNT(*) FROM active_positions")
+        acik = cursor.fetchone()[0] or 0
+        acilan = kapanan + acik
+    except:
+        acilan, kapanan, acik, tp1, tp2, sl, tp2_bekliyor = 0, 0, 0, 0, 0, 0, 0
+    finally:
+        conn.close()
+    return acilan, kapanan, acik, tp1, tp2, sl, tp2_bekliyor
+
 init_db()
 
 def get_okx():
@@ -135,6 +159,73 @@ def get_okx():
         'options':  {'defaultType': 'swap'},
         'enableRateLimit': True
     })
+
+# ================================================================
+# YENİ: FIBO HESAPLAMA VE KONTROL
+# ================================================================
+
+def get_previous_day_hl(okx, symbol):
+    """
+    OKX'ten bir önceki günün high ve low değerini çeker.
+    İndikatördeki high[1] / low[1] mantığıyla aynı.
+    """
+    try:
+        # Günlük mum verisi — son 2 mum yeterli
+        ohlcv = okx.fetch_ohlcv(symbol, timeframe='1d', limit=2)
+        if not ohlcv or len(ohlcv) < 2:
+            return None, None
+        # ohlcv[-2] = dün kapanan mum [timestamp, open, high, low, close, volume]
+        prev = ohlcv[-2]
+        fhigh = prev[2]
+        flow  = prev[3]
+        print(f"📊 Önceki gün H:{fhigh} L:{flow} ({symbol})")
+        return fhigh, flow
+    except Exception as e:
+        print(f"⚠️ Günlük mum alınamadı {symbol}: {e}")
+        return None, None
+
+
+def calc_fibo_levels(side, fhigh, flow):
+    """
+    İndikatörle birebir aynı formül:
+    F = (Fhigh - Flow) * çarpan + Flow
+    """
+    diff = fhigh - flow
+    if side == 'buy':  # LONG
+        return [
+            flow + diff * 0.618,   # step1
+            fhigh,                  # step2 → 1.0 = Fhigh
+            flow + diff * 1.618,   # step3
+            flow + diff * 2.000,   # step4
+            flow + diff * 2.618,   # step5
+        ]
+    else:  # SHORT
+        return [
+            flow + diff * 2.000,   # step1
+            flow + diff * 2.618,   # step2
+            flow + diff * 3.000,   # step3
+            flow + diff * 3.618,   # step4
+        ]
+
+
+def check_fibo_distance(side, fhigh, flow, min_dist_pct):
+    """
+    Tüm DCA adımları arasındaki % mesafeyi kontrol eder.
+    Herhangi biri min_dist_pct'den küçükse False döner.
+    """
+    levels = calc_fibo_levels(side, fhigh, flow)
+    for i in range(len(levels) - 1):
+        a = levels[i]
+        b = levels[i + 1]
+        dist = abs(b - a) / a * 100
+        print(f"  Step{i+1}→Step{i+2}: {a:.6f} → {b:.6f} = %{dist:.2f}")
+        if dist < min_dist_pct:
+            print(f"  ❌ Fibo mesafe engeli: %{dist:.2f} < min %{min_dist_pct}")
+            return False, i + 1, dist
+    print(f"  ✅ Tüm fibo adımları min %{min_dist_pct} üstünde")
+    return True, None, None
+
+# ================================================================
 
 def self_ping():
     while True:
@@ -199,7 +290,6 @@ def tp_monitor():
                         hit_tp1   = cur_price >= tp1_price
                         hit_tp2   = cur_price >= tp2_price
                         pnl_pct   = (cur_price - avg_price) / avg_price * 100
-                        # SL kontrolü: TP1 sonrası fiyat avg_entry'nin altına düşerse
                         hit_sl    = sl_active and (cur_price <= avg_price)
                     else:
                         tp1_price = avg_price * (1 - tp1_pct)
@@ -207,7 +297,6 @@ def tp_monitor():
                         hit_tp1   = cur_price <= tp1_price
                         hit_tp2   = cur_price <= tp2_price
                         pnl_pct   = (avg_price - cur_price) / avg_price * 100
-                        # SL kontrolü: TP1 sonrası fiyat avg_entry'nin üstüne çıkarsa
                         hit_sl    = sl_active and (cur_price >= avg_price)
 
                     close_side = 'sell' if side == 'buy' else 'buy'
@@ -215,17 +304,14 @@ def tp_monitor():
                     pos_val    = avg_price * total_contracts
                     pnl_usd    = pos_val * (pnl_pct / 100) * 10
 
-                    print(f"👁 {symbol} | Fiyat:{cur_price} | Ort:{avg_price:.4f} | TP1:{tp1_price:.4f} | TP2:{tp2_price:.4f} | SL_Aktif:{bool(sl_active)}")
+                    print(f"👁 {symbol} | Fiyat:{cur_price} | Ort:{avg_price:.4f} | SL_Aktif:{bool(sl_active)}")
 
-                    # --- SL KONTROLÜ (TP1 sonrası breakeven) ---
                     if hit_sl and not tp2_done:
-                        print(f"🛡 SL TETİKLENDİ → {symbol} | Fiyat:{cur_price} | Entry:{avg_price}")
                         okx.create_market_order(
                             symbol=symbol, side=close_side, amount=total_contracts,
                             params={"posSide": pos_side, "reduceOnly": True}
                         )
                         sym_short = symbol.replace('/USDT:USDT', '')
-                        # PnL ~0 çünkü entry fiyatında kapandı
                         send_telegram(
                             f"🛡 <b>SL (Breakeven) Tetiklendi!</b>\n"
                             f"Sembol: <b>{sym_short}</b>\n"
@@ -234,17 +320,15 @@ def tp_monitor():
                             f"Entry: ${avg_price:.4f}\n"
                             f"PnL: ~$0 (Breakeven koruması)"
                         )
-                        conn2  = sqlite3.connect('bot_settings.db')
-                        cur2   = conn2.cursor()
+                        conn2 = sqlite3.connect('bot_settings.db')
+                        cur2  = conn2.cursor()
                         cur2.execute("INSERT INTO trades (symbol,side,status,pnl,closed_at) VALUES (?,?,?,?,?)",
                                      (symbol, side, 'SL_BREAKEVEN', round(pnl_usd, 2), datetime.now().strftime('%Y-%m-%d %H:%M')))
                         cur2.execute("DELETE FROM active_positions WHERE symbol=?", (symbol,))
                         conn2.commit()
                         conn2.close()
-                        print(f"🏁 {symbol} SL ile kapatıldı")
                         continue
 
-                    # --- TP2 KONTROLÜ ---
                     if hit_tp2 and not tp2_done:
                         qty = math.floor(total_contracts * tp2_qty * 10) / 10
                         if qty <= 0:
@@ -253,7 +337,6 @@ def tp_monitor():
                             symbol=symbol, side=close_side, amount=qty,
                             params={"posSide": pos_side, "reduceOnly": True}
                         )
-                        print(f"✅ TP2 → {symbol} | {qty} kontrat")
                         sym_short = symbol.replace('/USDT:USDT', '')
                         send_telegram(
                             f"✅ <b>TP2 HIT!</b>\n"
@@ -262,21 +345,19 @@ def tp_monitor():
                             f"Fiyat: ${cur_price:.4f}\n"
                             f"PnL: +${pnl_usd:.2f} USDT (+{pnl_pct:.2f}%)"
                         )
-                        conn2  = sqlite3.connect('bot_settings.db')
-                        cur2   = conn2.cursor()
+                        conn2 = sqlite3.connect('bot_settings.db')
+                        cur2  = conn2.cursor()
                         remaining = max(0, total_contracts - qty)
                         if remaining <= 0:
                             cur2.execute("INSERT INTO trades (symbol,side,status,pnl,closed_at) VALUES (?,?,?,?,?)",
                                          (symbol, side, 'TP2', round(pnl_usd, 2), datetime.now().strftime('%Y-%m-%d %H:%M')))
                             cur2.execute("DELETE FROM active_positions WHERE symbol=?", (symbol,))
-                            print(f"🏁 {symbol} tamamen kapatıldı")
                         else:
                             cur2.execute("UPDATE active_positions SET tp2_done=1, total_contracts=? WHERE symbol=?",
                                          (remaining, symbol))
                         conn2.commit()
                         conn2.close()
 
-                    # --- TP1 KONTROLÜ ---
                     elif hit_tp1 and not tp1_done:
                         qty = math.floor(total_contracts * tp1_qty * 10) / 10
                         if qty <= 0:
@@ -285,7 +366,6 @@ def tp_monitor():
                             symbol=symbol, side=close_side, amount=qty,
                             params={"posSide": pos_side, "reduceOnly": True}
                         )
-                        print(f"✅ TP1 → {symbol} | {qty} kontrat | SL aktifleştiriliyor @ {avg_price:.4f}")
                         sym_short = symbol.replace('/USDT:USDT', '')
                         send_telegram(
                             f"🎯 <b>TP1 HIT!</b>\n"
@@ -295,10 +375,9 @@ def tp_monitor():
                             f"PnL: +${pnl_usd:.2f} USDT (+{pnl_pct:.2f}%)\n"
                             f"🛡 SL Breakeven aktif @ ${avg_price:.4f}"
                         )
-                        conn2  = sqlite3.connect('bot_settings.db')
-                        cur2   = conn2.cursor()
+                        conn2 = sqlite3.connect('bot_settings.db')
+                        cur2  = conn2.cursor()
                         remaining = max(0, total_contracts - qty)
-                        # tp1_done=1 ve sl_active=1 aynı anda set ediliyor
                         cur2.execute(
                             "UPDATE active_positions SET tp1_done=1, sl_active=1, total_contracts=? WHERE symbol=?",
                             (remaining, symbol)
@@ -314,56 +393,68 @@ def tp_monitor():
 
         time.sleep(10)
 
-threading.Thread(target=tp_monitor,         daemon=True).start()
-threading.Thread(target=self_ping,          daemon=True).start()
-threading.Thread(target=record_pnl_snapshot,daemon=True).start()
+threading.Thread(target=tp_monitor,          daemon=True).start()
+threading.Thread(target=self_ping,           daemon=True).start()
+threading.Thread(target=record_pnl_snapshot, daemon=True).start()
 
-@app.route('/', methods=['GET'])
-def dashboard():
+@app.route('/dashboard_data', methods=['GET'])
+def dashboard_data():
     total, win_rate, total_pnl = get_stats()
-    api_status = "✅ Bağlı" if get_okx() else "❌ API Eksik"
+    acilan, kapanan, acik, tp1, tp2, sl, tp2_bekliyor = get_daily_stats()
 
-    conn   = sqlite3.connect('bot_settings.db')
+    conn = sqlite3.connect('bot_settings.db')
     cursor = conn.cursor()
     cursor.execute("SELECT symbol, side, avg_entry_price, total_contracts, current_step, tp1_done, tp2_done, sl_active FROM active_positions")
     active_pos = cursor.fetchall()
-
     cursor.execute("SELECT pnl, recorded_at FROM pnl_history ORDER BY id DESC LIMIT 24")
     pnl_rows = cursor.fetchall()
     conn.close()
 
-    pnl_labels = [r[1] for r in reversed(pnl_rows)]
-    pnl_data   = [round(r[0], 2) for r in reversed(pnl_rows)]
-
-    tg_configured = "✅ Aktif" if TELEGRAM_TOKEN and TELEGRAM_CHAT_ID else "❌ Ayarlanmadı"
-
-    pos_json = json.dumps([
+    positions = [
         {"symbol": p[0], "side": p[1], "avgPrice": p[2], "contracts": p[3],
          "step": p[4], "tp1Done": bool(p[5]), "tp2Done": bool(p[6]), "slActive": bool(p[7])}
         for p in active_pos
-    ])
+    ]
+    pnl_labels = [r[1] for r in reversed(pnl_rows)]
+    pnl_data   = [round(r[0], 2) for r in reversed(pnl_rows)]
+
+    return jsonify({
+        "total":        total,
+        "win_rate":     round(win_rate, 1),
+        "total_pnl":    round(total_pnl, 2),
+        "acilan":       acilan,
+        "kapanan":      kapanan,
+        "acik":         acik,
+        "tp1":          tp1,
+        "tp2":          tp2,
+        "sl":           sl,
+        "tp2_bekliyor": tp2_bekliyor,
+        "positions":    positions,
+        "pnl_labels":   pnl_labels,
+        "pnl_data":     pnl_data,
+        "today":        datetime.now().strftime('%d %b %Y'),
+    })
+
+@app.route('/', methods=['GET'])
+def dashboard():
+    api_status    = "✅ Bağlı" if get_okx() else "❌ API Eksik"
+    tg_configured = "✅ Aktif" if TELEGRAM_TOKEN and TELEGRAM_CHAT_ID else "❌ Ayarlanmadı"
 
     context = {
-        'api_status':     api_status,
-        'tg_status':      tg_configured,
-        'l1_usd':         get_setting('l1_usd',  '40'),
-        'd1_usd':         get_setting('d1_usd',  '60'),
-        'd2_usd':         get_setting('d2_usd',  '90'),
-        'd3_usd':         get_setting('d3_usd',  '135'),
-        'd4_usd':         get_setting('d4_usd',  '202.5'),
-        'min_dist':       get_setting('min_dist', '2.0'),
-        'tp1_pct':        get_setting('tp1_pct',  '1.5'),
-        'tp1_qty':        get_setting('tp1_qty',  '50'),
-        'tp2_pct':        get_setting('tp2_pct',  '3.0'),
-        'tp2_qty':        get_setting('tp2_qty',  '50'),
-        'tg_token':       get_setting('tg_token', ''),
-        'tg_chat_id':     get_setting('tg_chat_id', ''),
-        'total':          total,
-        'win_rate':       f"{win_rate:.1f}%",
-        'pnl':            f"{total_pnl:.2f} USDT",
-        'pos_json':       Markup(pos_json),
-        'pnl_labels':     Markup(json.dumps(pnl_labels)),
-        'pnl_data':       Markup(json.dumps(pnl_data)),
+        'api_status': api_status,
+        'tg_status':  tg_configured,
+        'l1_usd':     get_setting('l1_usd',  '40'),
+        'd1_usd':     get_setting('d1_usd',  '60'),
+        'd2_usd':     get_setting('d2_usd',  '90'),
+        'd3_usd':     get_setting('d3_usd',  '135'),
+        'd4_usd':     get_setting('d4_usd',  '202.5'),
+        'min_dist':   get_setting('min_dist', '2.0'),
+        'tp1_pct':    get_setting('tp1_pct',  '1.5'),
+        'tp1_qty':    get_setting('tp1_qty',  '50'),
+        'tp2_pct':    get_setting('tp2_pct',  '3.0'),
+        'tp2_qty':    get_setting('tp2_qty',  '50'),
+        'tg_token':   get_setting('tg_token', ''),
+        'tg_chat_id': get_setting('tg_chat_id', ''),
     }
 
     html = '''<!DOCTYPE html>
@@ -421,20 +512,45 @@ input:focus{outline:none;border-color:#4caf50}
 .no-pos{text-align:center;color:#333;padding:20px;font-size:0.8rem}
 #live-indicator{display:inline-block;width:7px;height:7px;border-radius:50%;background:#4caf50;margin-right:5px;animation:pulse 2s infinite}
 @keyframes pulse{0%,100%{opacity:1}50%{opacity:.3}}
+.daily-inner{background:#111;border-radius:8px;padding:10px 14px;margin-bottom:10px;display:flex;justify-content:space-between;align-items:center}
+.daily-big{font-size:28px;font-weight:700;color:#e0e0e0}
+.daily-sub{font-size:11px;color:#555;margin-top:2px}
+.daily-row{display:flex;align-items:center;justify-content:space-between;padding:8px 0;border-bottom:1px solid #1a1a1e}
+.daily-row:last-child{border-bottom:none}
+.daily-label{font-size:12px;color:#666}
+.daily-val{font-size:18px;font-weight:700}
 </style>
 </head><body>
 
 <div class="header">🤖 S-DCA KONTROL PANELİ</div>
 
 <div class="stats">
-  <div class="stat"><div class="val">{{ total }}</div><div class="lbl">İşlem</div></div>
-  <div class="stat"><div class="val">{{ win_rate }}</div><div class="lbl">Kazanma</div></div>
-  <div class="stat"><div class="val">{{ pnl }}</div><div class="lbl">Toplam PnL</div></div>
+  <div class="stat"><div class="val" id="s-total">-</div><div class="lbl">İşlem</div></div>
+  <div class="stat"><div class="val" id="s-winrate">-</div><div class="lbl">Kazanma</div></div>
+  <div class="stat"><div class="val" id="s-pnl">-</div><div class="lbl">Toplam PnL</div></div>
 </div>
 
 <div class="card">
   <h2><span id="live-indicator"></span>Aktif Pozisyonlar <span id="last-update" style="float:right;color:#333;font-size:0.65rem;font-weight:400;text-transform:none"></span></h2>
   <div id="positions"><div class="no-pos">Yükleniyor...</div></div>
+</div>
+
+<div class="card">
+  <h2>📅 Bugünün Özeti <span id="today-str" style="float:right;color:#444;font-size:0.65rem;font-weight:400;text-transform:none"></span></h2>
+  <div class="daily-inner">
+    <div>
+      <div class="daily-big" id="d-acilan">-</div>
+      <div class="daily-sub">toplam açılan işlem</div>
+    </div>
+    <div style="text-align:right">
+      <div style="font-size:13px;color:#4caf50" id="d-kapanan">-</div>
+      <div style="font-size:13px;color:#555;margin-top:2px" id="d-acik">-</div>
+    </div>
+  </div>
+  <div class="daily-row"><span class="daily-label">TP1 oldu</span><span class="daily-val" style="color:#4caf50" id="d-tp1">-</span></div>
+  <div class="daily-row"><span class="daily-label">TP2 oldu</span><span class="daily-val" style="color:#42a5f5" id="d-tp2">-</span></div>
+  <div class="daily-row"><span class="daily-label">TP1 → SL yedi</span><span class="daily-val" style="color:#ffa726" id="d-sl">-</span></div>
+  <div class="daily-row"><span class="daily-label">TP2 bekliyor</span><span class="daily-val" style="color:#888" id="d-tp2bek">-</span></div>
 </div>
 
 <div class="card">
@@ -463,7 +579,8 @@ input:focus{outline:none;border-color:#4caf50}
 </div>
 <div class="card">
   <h2>⚙️ Filtreler & Kar Al</h2>
-  <label>Min. Uzaklık (%)</label><input type="number" step="0.1" name="min_dist" value="{{ min_dist }}">
+  <label>Min. Fibo Mesafesi (%) — İlk girişte kontrol edilir</label>
+  <input type="number" step="0.1" name="min_dist" value="{{ min_dist }}">
   <label>TP1 Oranı (%)</label><input type="number" step="0.1" name="tp1_pct" value="{{ tp1_pct }}">
   <label>TP1 Satış (%)</label><input type="number" name="tp1_qty" value="{{ tp1_qty }}">
   <label>TP2 Oranı (%)</label><input type="number" step="0.1" name="tp2_pct" value="{{ tp2_pct }}">
@@ -478,35 +595,29 @@ input:focus{outline:none;border-color:#4caf50}
 </form>
 
 <script>
-const POSITIONS = {{ pos_json }};
-const PNL_LABELS = {{ pnl_labels }};
-const PNL_DATA   = {{ pnl_data }};
-
+let pnlChart = null;
 function fmtU(n){return (n>=0?'+$':'-$')+Math.abs(n).toFixed(2)}
 function fmt(n,d=2){return (n>=0?'+':'')+n.toFixed(d)}
 
-function renderPositions(prices){
+function renderPositions(positions, prices){
   const container = document.getElementById('positions');
-  if(!POSITIONS.length){
-    container.innerHTML = '<div class="no-pos">Aktif pozisyon yok</div>';
-    return;
-  }
-  let html = '';
-  POSITIONS.forEach(p=>{
-    const cur = prices[p.symbol] || p.avgPrice;
-    const dir = p.side==='buy'?1:-1;
-    const pnlPct = (cur - p.avgPrice)/p.avgPrice*100*dir;
-    const posVal = p.avgPrice * p.contracts;
-    const pnlUsd = posVal*(pnlPct/100)*10;
-    const isPos = pnlUsd>=0;
-    const cls = isPos?'pos-val':'neg-val';
-    const barW = Math.min(Math.abs(pnlPct)*15,100);
-    const barClr = isPos?'#4caf50':'#f44336';
-    const tp1p = p.side==='buy'? p.avgPrice*1.015 : p.avgPrice*0.985;
-    const tp2p = p.side==='buy'? p.avgPrice*1.030 : p.avgPrice*0.970;
-    const dist = ((tp1p-cur)/cur*100*(p.side==='buy'?1:-1));
-    const sym = p.symbol.replace('/USDT:USDT','');
-    html += `
+  if(!positions.length){container.innerHTML='<div class="no-pos">Aktif pozisyon yok</div>';return;}
+  let html='';
+  positions.forEach(p=>{
+    const cur=prices[p.symbol]||p.avgPrice;
+    const dir=p.side==='buy'?1:-1;
+    const pnlPct=(cur-p.avgPrice)/p.avgPrice*100*dir;
+    const posVal=p.avgPrice*p.contracts;
+    const pnlUsd=posVal*(pnlPct/100)*10;
+    const isPos=pnlUsd>=0;
+    const cls=isPos?'pos-val':'neg-val';
+    const barW=Math.min(Math.abs(pnlPct)*15,100);
+    const barClr=isPos?'#4caf50':'#f44336';
+    const tp1p=p.side==='buy'?p.avgPrice*1.015:p.avgPrice*0.985;
+    const tp2p=p.side==='buy'?p.avgPrice*1.030:p.avgPrice*0.970;
+    const dist=((tp1p-cur)/cur*100*(p.side==='buy'?1:-1));
+    const sym=p.symbol.replace('/USDT:USDT','');
+    html+=`
     <div class="pos-card">
       <div class="pos-header">
         <div style="display:flex;align-items:center;gap:7px">
@@ -539,65 +650,60 @@ function renderPositions(prices){
       </div>
     </div>`;
   });
-  container.innerHTML = html;
-  document.getElementById('last-update').textContent =
-    'Güncellendi: ' + new Date().toLocaleTimeString('tr-TR');
+  container.innerHTML=html;
 }
 
-async function fetchPrices(){
-  if(!POSITIONS.length) return {};
+function updatePnlChart(labels,data){
+  if(data.length<=1){
+    document.getElementById('pnlChart').parentElement.innerHTML='<div class="no-pos" style="padding:40px">Yeterli veri yok — grafik saatlik kaydedilir</div>';
+    return;
+  }
+  if(pnlChart){pnlChart.data.labels=labels;pnlChart.data.datasets[0].data=data;pnlChart.update();}
+  else{
+    pnlChart=new Chart(document.getElementById('pnlChart'),{
+      type:'line',
+      data:{labels,datasets:[{label:'PnL (USDT)',data,borderColor:'#4caf50',backgroundColor:'rgba(76,175,80,0.08)',borderWidth:2,pointRadius:3,pointBackgroundColor:'#4caf50',fill:true,tension:0.4}]},
+      options:{responsive:true,maintainAspectRatio:false,plugins:{legend:{display:false}},
+        scales:{x:{ticks:{color:'#555',font:{size:9}},grid:{color:'#1a1a1e'}},y:{ticks:{color:'#555',font:{size:9},callback:v=>'$'+v},grid:{color:'#1a1a1e'}}}}
+    });
+  }
+}
+
+async function fetchPrices(positions){
+  if(!positions.length) return {};
+  try{const syms=positions.map(p=>p.symbol).join(',');const r=await fetch('/prices?symbols='+encodeURIComponent(syms));return await r.json();}
+  catch(e){return{};}
+}
+
+async function refreshAll(){
   try{
-    const syms = POSITIONS.map(p=>p.symbol).join(',');
-    const r = await fetch('/prices?symbols='+encodeURIComponent(syms));
-    return await r.json();
-  }catch(e){ return {}; }
+    const r=await fetch('/dashboard_data');
+    const d=await r.json();
+    document.getElementById('s-total').textContent=d.total;
+    document.getElementById('s-winrate').textContent=d.win_rate.toFixed(1)+'%';
+    document.getElementById('s-pnl').textContent=d.total_pnl.toFixed(2)+' USDT';
+    document.getElementById('today-str').textContent=d.today;
+    document.getElementById('d-acilan').textContent=d.acilan;
+    document.getElementById('d-kapanan').textContent=d.kapanan+' kapandı';
+    document.getElementById('d-acik').textContent=d.acik+' açık';
+    document.getElementById('d-tp1').textContent=d.tp1;
+    document.getElementById('d-tp2').textContent=d.tp2;
+    document.getElementById('d-sl').textContent=d.sl;
+    document.getElementById('d-tp2bek').textContent=d.tp2_bekliyor;
+    const prices=await fetchPrices(d.positions);
+    renderPositions(d.positions,prices);
+    updatePnlChart(d.pnl_labels,d.pnl_data);
+    document.getElementById('last-update').textContent='Güncellendi: '+new Date().toLocaleTimeString('tr-TR');
+  }catch(e){console.error('Güncelleme hatası:',e);}
 }
 
-async function refresh(){
-  const prices = await fetchPrices();
-  renderPositions(prices);
-}
+refreshAll();
+setInterval(refreshAll,30000);
 
-refresh();
-setInterval(refresh, 10000);
-
-if(PNL_DATA.length > 1){
-  new Chart(document.getElementById('pnlChart'),{
-    type:'line',
-    data:{
-      labels: PNL_LABELS,
-      datasets:[{
-        label:'PnL (USDT)',
-        data: PNL_DATA,
-        borderColor:'#4caf50',
-        backgroundColor:'rgba(76,175,80,0.08)',
-        borderWidth:2,
-        pointRadius:3,
-        pointBackgroundColor:'#4caf50',
-        fill:true,
-        tension:0.4
-      }]
-    },
-    options:{
-      responsive:true,
-      maintainAspectRatio:false,
-      plugins:{legend:{display:false}},
-      scales:{
-        x:{ticks:{color:'#555',font:{size:9}},grid:{color:'#1a1a1e'}},
-        y:{ticks:{color:'#555',font:{size:9},callback:v=>'$'+v},grid:{color:'#1a1a1e'}}
-      }
-    }
-  });
-} else {
-  document.getElementById('pnlChart').parentElement.innerHTML =
-    '<div class="no-pos" style="padding:40px">Yeterli veri yok — grafik saatlik kaydedilir</div>';
-}
-
-function closePos(symbol, side){
+function closePos(symbol,side){
   if(!confirm(symbol.replace('/USDT:USDT','')+' pozisyonunu kapatmak istediğine emin misin?')) return;
-  fetch('/close',{method:'POST',headers:{'Content-Type':'application/json'},
-    body:JSON.stringify({symbol,side})})
-  .then(r=>r.json()).then(d=>{alert(d.message||'Tamamlandı');location.reload();})
+  fetch('/close',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({symbol,side})})
+  .then(r=>r.json()).then(d=>{alert(d.message||'Tamamlandı');refreshAll();})
   .catch(e=>alert('Hata: '+e));
 }
 </script>
@@ -675,7 +781,6 @@ def close_position():
             symbol=symbol, side=close_side, amount=total_contracts,
             params={"posSide": pos_side, "reduceOnly": True}
         )
-        print(f"🛑 MANUEL KAPATMA → {symbol}")
         sym_short = symbol.replace('/USDT:USDT', '')
         send_telegram(
             f"🛑 <b>Manuel Kapatma</b>\n"
@@ -692,7 +797,6 @@ def close_position():
         conn2.close()
         return jsonify({"status": "success", "message": f"{sym_short} kapatıldı | PnL: ${pnl_usd:.2f}"}), 200
     except Exception as e:
-        print(f"❌ Manuel kapatma hatası: {e}")
         return jsonify({"status": "error", "message": str(e)}), 200
 
 def fmt_pct(n):
@@ -705,7 +809,6 @@ def webhook():
     try:
         data = json.loads(payload)
     except:
-        print("❌ JSON parse hatası")
         return jsonify({"status": "error", "message": "Gecersiz JSON"}), 200
 
     raw_symbol    = data.get('symbol')
@@ -714,14 +817,11 @@ def webhook():
     current_price = float(data.get('price', 0))
 
     if not raw_symbol or not current_price:
-        print("❌ Eksik veri")
         return jsonify({"status": "error", "message": "Eksik veri"}), 200
 
     symbol = raw_symbol.replace('.P', '').replace('-', '').replace('_', '').strip()
     if "USDT" in symbol and ":" not in symbol:
         symbol = symbol.replace("USDT", "/USDT:USDT")
-
-    print(f"📊 {symbol} | {side.upper()} | Step:{step} | Fiyat:{current_price}")
 
     budgets = {
         1: float(get_setting('l1_usd',  40)),
@@ -735,8 +835,46 @@ def webhook():
 
     okx = get_okx()
     if not okx:
-        print("❌ API anahtarları eksik!")
         return jsonify({"status": "error", "message": "API anahtarlari eksik"}), 200
+
+    # load_markets tek seferde çağrılıyor
+    try:
+        okx.load_markets()
+    except Exception as e:
+        return jsonify({"status": "error", "message": f"Market yüklenemedi: {e}"}), 200
+
+    # ================================================================
+    # YENİ: STEP 1 İÇİN FİBO MESAFE FİLTRESİ
+    # ================================================================
+    if step == 1:
+        try:
+            fhigh, flow = get_previous_day_hl(okx, symbol)
+            if fhigh is None or flow is None or fhigh == flow:
+                print(f"⚠️ Fibo verisi alınamadı, filtre atlanıyor ({symbol})")
+            else:
+                passed, fail_step, fail_dist = check_fibo_distance(side, fhigh, flow, min_distance_filter)
+                if not passed:
+                    sym_short = symbol.replace('/USDT:USDT', '')
+                    msg = (
+                        f"🚫 <b>Fibo Mesafe Engeli</b>\n"
+                        f"Sembol: <b>{sym_short}</b>\n"
+                        f"Yön: {'LONG' if side=='buy' else 'SHORT'}\n"
+                        f"Step{fail_step}→Step{fail_step+1} arası: %{fail_dist:.2f}\n"
+                        f"Min gereken: %{min_distance_filter}\n"
+                        f"❌ İşleme girilmedi"
+                    )
+                    send_telegram(msg)
+                    print(f"🚫 {symbol} fibo mesafe engeli — Step{fail_step} arası %{fail_dist:.2f}")
+                    return jsonify({
+                        "status":   "ignored",
+                        "message":  f"Fibo mesafe engeli: Step{fail_step} arası %{fail_dist:.2f} < min %{min_distance_filter}",
+                        "fibo_h":   fhigh,
+                        "fibo_l":   flow,
+                        "fail_pct": round(fail_dist, 2)
+                    }), 200
+        except Exception as e:
+            print(f"⚠️ Fibo kontrol hatası, devam ediliyor: {e}")
+    # ================================================================
 
     conn   = sqlite3.connect('bot_settings.db')
     cursor = conn.cursor()
@@ -746,11 +884,9 @@ def webhook():
     if position:
         pos_side, last_entry_price, current_step, avg_entry_price, total_contracts = position
         if step == 1 and current_step >= 1:
-            print(f"⛔ STEP 1 Engeli: {symbol} zaten aktif")
             conn.close()
             return jsonify({"status": "ignored", "message": "Pozisyon zaten açık"}), 200
         if step == current_step:
-            print(f"⛔ Aynı Step: {step}")
             conn.close()
             return jsonify({"status": "ignored", "message": f"Step {step} zaten işlendi"}), 200
         if step > 1:
@@ -794,14 +930,11 @@ def webhook():
             final_qty = min_qty if min_qty else 1
 
         pos_side = "long" if side == "buy" else "short"
-        print(f"🚀 EMİR → {symbol} | {side.upper()} | {final_qty} kontrat | ${allocated_usd}")
-
         order = okx.create_market_order(
             symbol=symbol, side=side, amount=final_qty,
             params={"posSide": pos_side}
         )
         order_id = order.get('id', 'N/A')
-        print(f"✅ İŞLEM AÇILDI! Order ID: {order_id}")
 
         sym_short = symbol.replace('/USDT:USDT', '')
         send_telegram(
@@ -827,7 +960,6 @@ def webhook():
                 "UPDATE active_positions SET last_entry_price=?,current_step=?,avg_entry_price=?,total_contracts=? WHERE symbol=?",
                 (current_price, step, new_avg, new_total, symbol)
             )
-            print(f"📐 Ort.Fiyat:{new_avg:.4f} | Toplam:{new_total} kontrat")
 
         conn.commit()
         conn.close()
@@ -835,7 +967,6 @@ def webhook():
 
     except Exception as e:
         conn.close()
-        print(f"❌ BORSA HATASI: {str(e)}")
         return jsonify({"status": "error", "okx_error": str(e)}), 200
 
 if __name__ == '__main__':
