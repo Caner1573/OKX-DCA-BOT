@@ -160,22 +160,49 @@ def get_okx():
         'enableRateLimit': True
     })
 
+def get_okx_positions():
+    """OKX'ten gerçek pozisyon verilerini çeker"""
+    try:
+        okx = get_okx()
+        if not okx:
+            return {}
+        positions = okx.fetch_positions()
+        result = {}
+        for pos in positions:
+            if not pos or float(pos.get('contracts', 0) or 0) == 0:
+                continue
+            symbol     = pos.get('symbol', '')
+            side       = pos.get('side', '')        # 'long' veya 'short'
+            entry      = float(pos.get('entryPrice', 0) or 0)
+            mark       = float(pos.get('markPrice', 0) or 0)
+            pnl_usd    = float(pos.get('unrealizedPnl', 0) or 0)
+            size_usd   = float(pos.get('notional', 0) or 0)
+            pnl_pct    = float(pos.get('percentage', 0) or 0)
+            contracts  = float(pos.get('contracts', 0) or 0)
+            result[symbol] = {
+                'entryPrice': entry,
+                'markPrice':  mark,
+                'pnlUsd':     round(pnl_usd, 2),
+                'pnlPct':     round(pnl_pct, 2),
+                'sizeUsd':    round(abs(size_usd), 2),
+                'contracts':  contracts,
+                'side':       side,
+            }
+        return result
+    except Exception as e:
+        print(f"⚠️ OKX pozisyon çekme hatası: {e}")
+        return {}
+
 # ================================================================
-# YENİ: FIBO HESAPLAMA VE KONTROL
+# FİBO HESAPLAMA VE KONTROL
 # ================================================================
 
 def get_previous_day_hl(okx, symbol):
-    """
-    OKX'ten bir önceki günün high ve low değerini çeker.
-    İndikatördeki high[1] / low[1] mantığıyla aynı.
-    """
     try:
-        # Günlük mum verisi — son 2 mum yeterli
         ohlcv = okx.fetch_ohlcv(symbol, timeframe='1d', limit=2)
         if not ohlcv or len(ohlcv) < 2:
             return None, None
-        # ohlcv[-2] = dün kapanan mum [timestamp, open, high, low, close, volume]
-        prev = ohlcv[-2]
+        prev  = ohlcv[-2]
         fhigh = prev[2]
         flow  = prev[3]
         print(f"📊 Önceki gün H:{fhigh} L:{flow} ({symbol})")
@@ -184,39 +211,29 @@ def get_previous_day_hl(okx, symbol):
         print(f"⚠️ Günlük mum alınamadı {symbol}: {e}")
         return None, None
 
-
 def calc_fibo_levels(side, fhigh, flow):
-    """
-    İndikatörle birebir aynı formül:
-    F = (Fhigh - Flow) * çarpan + Flow
-    """
     diff = fhigh - flow
-    if side == 'buy':  # LONG
+    if side == 'buy':
         return [
-            flow + diff * 0.618,   # step1
-            fhigh,                  # step2 → 1.0 = Fhigh
-            flow + diff * 1.618,   # step3
-            flow + diff * 2.000,   # step4
-            flow + diff * 2.618,   # step5
+            flow + diff * 0.618,
+            fhigh,
+            flow + diff * 1.618,
+            flow + diff * 2.000,
+            flow + diff * 2.618,
         ]
-    else:  # SHORT
+    else:
         return [
-            flow + diff * 2.000,   # step1
-            flow + diff * 2.618,   # step2
-            flow + diff * 3.000,   # step3
-            flow + diff * 3.618,   # step4
+            flow + diff * 2.000,
+            flow + diff * 2.618,
+            flow + diff * 3.000,
+            flow + diff * 3.618,
         ]
-
 
 def check_fibo_distance(side, fhigh, flow, min_dist_pct):
-    """
-    Tüm DCA adımları arasındaki % mesafeyi kontrol eder.
-    Herhangi biri min_dist_pct'den küçükse False döner.
-    """
     levels = calc_fibo_levels(side, fhigh, flow)
     for i in range(len(levels) - 1):
-        a = levels[i]
-        b = levels[i + 1]
+        a    = levels[i]
+        b    = levels[i + 1]
         dist = abs(b - a) / a * 100
         print(f"  Step{i+1}→Step{i+2}: {a:.6f} → {b:.6f} = %{dist:.2f}")
         if dist < min_dist_pct:
@@ -247,7 +264,7 @@ def record_pnl_snapshot():
             conn   = sqlite3.connect('bot_settings.db')
             cursor = conn.cursor()
             cursor.execute("SELECT SUM(pnl) FROM trades")
-            row = cursor.fetchone()
+            row       = cursor.fetchone()
             total_pnl = row[0] if row[0] else 0.0
             cursor.execute("INSERT INTO pnl_history (pnl, recorded_at) VALUES (?, ?)",
                            (total_pnl, datetime.now().strftime('%Y-%m-%d %H:%M')))
@@ -276,8 +293,23 @@ def tp_monitor():
                     if not okx:
                         continue
                     okx.load_markets()
-                    ticker    = okx.fetch_ticker(symbol)
-                    cur_price = ticker['last']
+
+                    # OKX'ten gerçek fiyat ve PnL
+                    okx_positions = okx.fetch_positions([symbol])
+                    cur_price     = None
+                    real_pnl_usd  = None
+                    real_pnl_pct  = None
+
+                    for p in okx_positions:
+                        if p and float(p.get('contracts', 0) or 0) > 0:
+                            cur_price    = float(p.get('markPrice', 0) or 0)
+                            real_pnl_usd = float(p.get('unrealizedPnl', 0) or 0)
+                            real_pnl_pct = float(p.get('percentage', 0) or 0)
+                            break
+
+                    if not cur_price:
+                        ticker    = okx.fetch_ticker(symbol)
+                        cur_price = ticker['last']
 
                     tp1_pct = float(get_setting('tp1_pct', 1.5)) / 100
                     tp2_pct = float(get_setting('tp2_pct', 3.0)) / 100
@@ -289,22 +321,20 @@ def tp_monitor():
                         tp2_price = avg_price * (1 + tp2_pct)
                         hit_tp1   = cur_price >= tp1_price
                         hit_tp2   = cur_price >= tp2_price
-                        pnl_pct   = (cur_price - avg_price) / avg_price * 100
                         hit_sl    = sl_active and (cur_price <= avg_price)
                     else:
                         tp1_price = avg_price * (1 - tp1_pct)
                         tp2_price = avg_price * (1 - tp2_pct)
                         hit_tp1   = cur_price <= tp1_price
                         hit_tp2   = cur_price <= tp2_price
-                        pnl_pct   = (avg_price - cur_price) / avg_price * 100
                         hit_sl    = sl_active and (cur_price >= avg_price)
 
-                    close_side = 'sell' if side == 'buy' else 'buy'
-                    pos_side   = 'long' if side == 'buy' else 'short'
-                    pos_val    = avg_price * total_contracts
-                    pnl_usd    = pos_val * (pnl_pct / 100) * 10
+                    close_side  = 'sell' if side == 'buy' else 'buy'
+                    pos_side    = 'long' if side == 'buy' else 'short'
+                    pnl_usd     = real_pnl_usd if real_pnl_usd is not None else 0
+                    pnl_pct_val = real_pnl_pct if real_pnl_pct is not None else 0
 
-                    print(f"👁 {symbol} | Fiyat:{cur_price} | Ort:{avg_price:.4f} | SL_Aktif:{bool(sl_active)}")
+                    print(f"👁 {symbol} | Fiyat:{cur_price} | Ort:{avg_price:.4f} | PnL:{pnl_usd:.2f} | SL_Aktif:{bool(sl_active)}")
 
                     if hit_sl and not tp2_done:
                         okx.create_market_order(
@@ -343,7 +373,7 @@ def tp_monitor():
                             f"Sembol: <b>{sym_short}</b>\n"
                             f"Yön: {'LONG' if side=='buy' else 'SHORT'}\n"
                             f"Fiyat: ${cur_price:.4f}\n"
-                            f"PnL: +${pnl_usd:.2f} USDT (+{pnl_pct:.2f}%)"
+                            f"PnL: +${pnl_usd:.2f} USDT (+{pnl_pct_val:.2f}%)"
                         )
                         conn2 = sqlite3.connect('bot_settings.db')
                         cur2  = conn2.cursor()
@@ -372,7 +402,7 @@ def tp_monitor():
                             f"Sembol: <b>{sym_short}</b>\n"
                             f"Yön: {'LONG' if side=='buy' else 'SHORT'}\n"
                             f"Fiyat: ${cur_price:.4f}\n"
-                            f"PnL: +${pnl_usd:.2f} USDT (+{pnl_pct:.2f}%)\n"
+                            f"PnL: +${pnl_usd:.2f} USDT (+{pnl_pct_val:.2f}%)\n"
                             f"🛡 SL Breakeven aktif @ ${avg_price:.4f}"
                         )
                         conn2 = sqlite3.connect('bot_settings.db')
@@ -402,6 +432,7 @@ def dashboard_data():
     total, win_rate, total_pnl = get_stats()
     acilan, kapanan, acik, tp1, tp2, sl, tp2_bekliyor = get_daily_stats()
 
+    # DB'den takip bilgileri
     conn = sqlite3.connect('bot_settings.db')
     cursor = conn.cursor()
     cursor.execute("SELECT symbol, side, avg_entry_price, total_contracts, current_step, tp1_done, tp2_done, sl_active FROM active_positions")
@@ -410,11 +441,37 @@ def dashboard_data():
     pnl_rows = cursor.fetchall()
     conn.close()
 
-    positions = [
-        {"symbol": p[0], "side": p[1], "avgPrice": p[2], "contracts": p[3],
-         "step": p[4], "tp1Done": bool(p[5]), "tp2Done": bool(p[6]), "slActive": bool(p[7])}
-        for p in active_pos
-    ]
+    # OKX'ten gerçek pozisyon verileri
+    okx_pos = get_okx_positions()
+
+    positions = []
+    for p in active_pos:
+        symbol, side, avg_price, contracts, step, tp1_done, tp2_done, sl_active = p
+        okx = okx_pos.get(symbol, {})
+
+        # OKX'ten gelen gerçek değerler, yoksa DB'deki değer
+        real_entry   = okx.get('entryPrice', avg_price) or avg_price
+        real_mark    = okx.get('markPrice',  avg_price) or avg_price
+        real_pnl_usd = okx.get('pnlUsd',     0.0)
+        real_pnl_pct = okx.get('pnlPct',     0.0)
+        real_size    = okx.get('sizeUsd',     0.0)
+
+        positions.append({
+            "symbol":    symbol,
+            "side":      side,
+            "avgPrice":  real_entry,
+            "markPrice": real_mark,
+            "pnlUsd":    real_pnl_usd,
+            "pnlPct":    real_pnl_pct,
+            "sizeUsd":   real_size,
+            "contracts": contracts,
+            "step":      step,
+            "tp1Done":   bool(tp1_done),
+            "tp2Done":   bool(tp2_done),
+            "slActive":  bool(sl_active),
+            "slPrice":   real_entry,
+        })
+
     pnl_labels = [r[1] for r in reversed(pnl_rows)]
     pnl_data   = [round(r[0], 2) for r in reversed(pnl_rows)]
 
@@ -596,28 +653,41 @@ input:focus{outline:none;border-color:#4caf50}
 
 <script>
 let pnlChart = null;
-function fmtU(n){return (n>=0?'+$':'-$')+Math.abs(n).toFixed(2)}
-function fmt(n,d=2){return (n>=0?'+':'')+n.toFixed(d)}
 
-function renderPositions(positions, prices){
+function fmtU(n){
+  const abs = Math.abs(n).toFixed(2);
+  return (n >= 0 ? '+$' : '-$') + abs;
+}
+function fmt(n, d=2){
+  return (n >= 0 ? '+' : '') + n.toFixed(d);
+}
+
+function renderPositions(positions){
   const container = document.getElementById('positions');
-  if(!positions.length){container.innerHTML='<div class="no-pos">Aktif pozisyon yok</div>';return;}
-  let html='';
-  positions.forEach(p=>{
-    const cur=prices[p.symbol]||p.avgPrice;
-    const dir=p.side==='buy'?1:-1;
-    const pnlPct=(cur-p.avgPrice)/p.avgPrice*100*dir;
-    const posVal=p.avgPrice*p.contracts;
-    const pnlUsd=posVal*(pnlPct/100)*10;
-    const isPos=pnlUsd>=0;
-    const cls=isPos?'pos-val':'neg-val';
-    const barW=Math.min(Math.abs(pnlPct)*15,100);
-    const barClr=isPos?'#4caf50':'#f44336';
-    const tp1p=p.side==='buy'?p.avgPrice*1.015:p.avgPrice*0.985;
-    const tp2p=p.side==='buy'?p.avgPrice*1.030:p.avgPrice*0.970;
-    const dist=((tp1p-cur)/cur*100*(p.side==='buy'?1:-1));
-    const sym=p.symbol.replace('/USDT:USDT','');
-    html+=`
+  if(!positions.length){
+    container.innerHTML = '<div class="no-pos">Aktif pozisyon yok</div>';
+    return;
+  }
+  let html = '';
+  positions.forEach(p => {
+    const isPos  = p.pnlUsd >= 0;
+    const cls    = isPos ? 'pos-val' : 'neg-val';
+    const barW   = Math.min(Math.abs(p.pnlPct) * 5, 100);
+    const barClr = isPos ? '#4caf50' : '#f44336';
+    const sym    = p.symbol.replace('/USDT:USDT','');
+
+    const tp1_pct  = p.side === 'buy' ? 1.015 : 0.985;
+    const tp2_pct  = p.side === 'buy' ? 1.030 : 0.970;
+    const tp1Price = (p.avgPrice * tp1_pct).toFixed(4);
+    const tp2Price = (p.avgPrice * tp2_pct).toFixed(4);
+
+    // TP1'e kalan mesafe
+    const tp1Target = p.side === 'buy' ? p.avgPrice * 1.015 : p.avgPrice * 0.985;
+    const distToTp1 = p.side === 'buy'
+      ? (tp1Target - p.markPrice) / p.markPrice * 100
+      : (p.markPrice - tp1Target) / p.markPrice * 100;
+
+    html += `
     <div class="pos-card">
       <div class="pos-header">
         <div style="display:flex;align-items:center;gap:7px">
@@ -629,14 +699,17 @@ function renderPositions(positions, prices){
       <div class="divider"></div>
       <div class="grid2">
         <div class="cell"><div class="clabel">Ort. Giriş</div><div class="cval">$${p.avgPrice.toFixed(4)}</div></div>
-        <div class="cell"><div class="clabel">Güncel Fiyat</div><div class="cval ${cls}">$${cur.toFixed(4)}</div></div>
-        <div class="cell"><div class="clabel">Pozisyon ($)</div><div class="cval">$${posVal.toFixed(2)}</div></div>
-        <div class="cell"><div class="clabel">PnL (USDT)</div><div class="cval ${cls}">${fmtU(pnlUsd)}</div></div>
-        <div class="cell"><div class="clabel">PnL (%)</div><div class="cval ${cls}">${fmt(pnlPct)}%</div></div>
-        <div class="cell"><div class="clabel">TP1'e Uzaklık</div><div class="cval neu-val">${fmt(dist,2)}%</div></div>
+        <div class="cell"><div class="clabel">Mark Fiyat</div><div class="cval ${cls}">$${p.markPrice.toFixed(4)}</div></div>
+        <div class="cell"><div class="clabel">Pozisyon ($)</div><div class="cval">$${p.sizeUsd.toFixed(2)}</div></div>
+        <div class="cell"><div class="clabel">PnL (USDT)</div><div class="cval ${cls}">${fmtU(p.pnlUsd)}</div></div>
+        <div class="cell"><div class="clabel">PnL (%)</div><div class="cval ${cls}">${fmt(p.pnlPct)}%</div></div>
+        <div class="cell"><div class="clabel">TP1'e Uzaklık</div><div class="cval neu-val">${fmt(distToTp1,2)}%</div></div>
       </div>
       <div class="pnl-bar-wrap">
-        <div class="pnl-bar-label"><span>SL $${p.avgPrice.toFixed(4)}</span><span>TP1 $${tp1p.toFixed(4)} | TP2 $${tp2p.toFixed(4)}</span></div>
+        <div class="pnl-bar-label">
+          <span>SL $${p.slPrice.toFixed(4)}</span>
+          <span>TP1 $${tp1Price} | TP2 $${tp2Price}</span>
+        </div>
         <div class="pnl-bar-bg"><div class="pnl-bar-fill" style="width:${barW}%;background:${barClr}"></div></div>
       </div>
       <div class="divider"></div>
@@ -650,61 +723,90 @@ function renderPositions(positions, prices){
       </div>
     </div>`;
   });
-  container.innerHTML=html;
+  container.innerHTML = html;
 }
 
-function updatePnlChart(labels,data){
-  if(data.length<=1){
-    document.getElementById('pnlChart').parentElement.innerHTML='<div class="no-pos" style="padding:40px">Yeterli veri yok — grafik saatlik kaydedilir</div>';
+function updatePnlChart(labels, data){
+  if(data.length <= 1){
+    document.getElementById('pnlChart').parentElement.innerHTML =
+      '<div class="no-pos" style="padding:40px">Yeterli veri yok — grafik saatlik kaydedilir</div>';
     return;
   }
-  if(pnlChart){pnlChart.data.labels=labels;pnlChart.data.datasets[0].data=data;pnlChart.update();}
-  else{
-    pnlChart=new Chart(document.getElementById('pnlChart'),{
-      type:'line',
-      data:{labels,datasets:[{label:'PnL (USDT)',data,borderColor:'#4caf50',backgroundColor:'rgba(76,175,80,0.08)',borderWidth:2,pointRadius:3,pointBackgroundColor:'#4caf50',fill:true,tension:0.4}]},
-      options:{responsive:true,maintainAspectRatio:false,plugins:{legend:{display:false}},
-        scales:{x:{ticks:{color:'#555',font:{size:9}},grid:{color:'#1a1a1e'}},y:{ticks:{color:'#555',font:{size:9},callback:v=>'$'+v},grid:{color:'#1a1a1e'}}}}
+  if(pnlChart){
+    pnlChart.data.labels = labels;
+    pnlChart.data.datasets[0].data = data;
+    pnlChart.update();
+  } else {
+    pnlChart = new Chart(document.getElementById('pnlChart'), {
+      type: 'line',
+      data: {
+        labels,
+        datasets:[{
+          label: 'PnL (USDT)',
+          data,
+          borderColor: '#4caf50',
+          backgroundColor: 'rgba(76,175,80,0.08)',
+          borderWidth: 2,
+          pointRadius: 3,
+          pointBackgroundColor: '#4caf50',
+          fill: true,
+          tension: 0.4
+        }]
+      },
+      options:{
+        responsive: true,
+        maintainAspectRatio: false,
+        plugins:{ legend:{ display:false } },
+        scales:{
+          x:{ ticks:{ color:'#555', font:{ size:9 } }, grid:{ color:'#1a1a1e' } },
+          y:{ ticks:{ color:'#555', font:{ size:9 }, callback: v => '$'+v }, grid:{ color:'#1a1a1e' } }
+        }
+      }
     });
   }
 }
 
-async function fetchPrices(positions){
-  if(!positions.length) return {};
-  try{const syms=positions.map(p=>p.symbol).join(',');const r=await fetch('/prices?symbols='+encodeURIComponent(syms));return await r.json();}
-  catch(e){return{};}
-}
-
 async function refreshAll(){
   try{
-    const r=await fetch('/dashboard_data');
-    const d=await r.json();
-    document.getElementById('s-total').textContent=d.total;
-    document.getElementById('s-winrate').textContent=d.win_rate.toFixed(1)+'%';
-    document.getElementById('s-pnl').textContent=d.total_pnl.toFixed(2)+' USDT';
-    document.getElementById('today-str').textContent=d.today;
-    document.getElementById('d-acilan').textContent=d.acilan;
-    document.getElementById('d-kapanan').textContent=d.kapanan+' kapandı';
-    document.getElementById('d-acik').textContent=d.acik+' açık';
-    document.getElementById('d-tp1').textContent=d.tp1;
-    document.getElementById('d-tp2').textContent=d.tp2;
-    document.getElementById('d-sl').textContent=d.sl;
-    document.getElementById('d-tp2bek').textContent=d.tp2_bekliyor;
-    const prices=await fetchPrices(d.positions);
-    renderPositions(d.positions,prices);
-    updatePnlChart(d.pnl_labels,d.pnl_data);
-    document.getElementById('last-update').textContent='Güncellendi: '+new Date().toLocaleTimeString('tr-TR');
-  }catch(e){console.error('Güncelleme hatası:',e);}
+    const r = await fetch('/dashboard_data');
+    const d = await r.json();
+
+    document.getElementById('s-total').textContent   = d.total;
+    document.getElementById('s-winrate').textContent = d.win_rate.toFixed(1) + '%';
+    document.getElementById('s-pnl').textContent     = d.total_pnl.toFixed(2) + ' USDT';
+    document.getElementById('today-str').textContent  = d.today;
+    document.getElementById('d-acilan').textContent   = d.acilan;
+    document.getElementById('d-kapanan').textContent  = d.kapanan + ' kapandı';
+    document.getElementById('d-acik').textContent     = d.acik + ' açık';
+    document.getElementById('d-tp1').textContent      = d.tp1;
+    document.getElementById('d-tp2').textContent      = d.tp2;
+    document.getElementById('d-sl').textContent       = d.sl;
+    document.getElementById('d-tp2bek').textContent   = d.tp2_bekliyor;
+
+    renderPositions(d.positions);
+    updatePnlChart(d.pnl_labels, d.pnl_data);
+
+    document.getElementById('last-update').textContent =
+      'Güncellendi: ' + new Date().toLocaleTimeString('tr-TR');
+
+  } catch(e){
+    console.error('Güncelleme hatası:', e);
+  }
 }
 
 refreshAll();
-setInterval(refreshAll,30000);
+setInterval(refreshAll, 30000);
 
-function closePos(symbol,side){
+function closePos(symbol, side){
   if(!confirm(symbol.replace('/USDT:USDT','')+' pozisyonunu kapatmak istediğine emin misin?')) return;
-  fetch('/close',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({symbol,side})})
-  .then(r=>r.json()).then(d=>{alert(d.message||'Tamamlandı');refreshAll();})
-  .catch(e=>alert('Hata: '+e));
+  fetch('/close', {
+    method: 'POST',
+    headers: {'Content-Type':'application/json'},
+    body: JSON.stringify({symbol, side})
+  })
+  .then(r => r.json())
+  .then(d => { alert(d.message || 'Tamamlandı'); refreshAll(); })
+  .catch(e => alert('Hata: ' + e));
 }
 </script>
 </body></html>'''
@@ -770,13 +872,24 @@ def close_position():
         if not row or not row[0]:
             return jsonify({"status": "error", "message": "Pozisyon bulunamadı"}), 200
         total_contracts, avg_price = row
-        close_side = 'sell' if side == 'buy' else 'buy'
-        pos_side   = 'long' if side == 'buy' else 'short'
-        ticker     = okx.fetch_ticker(symbol)
-        cur_price  = ticker['last']
-        dir_       = 1 if side == 'buy' else -1
-        pnl_pct    = (cur_price - avg_price) / avg_price * 100 * dir_
-        pnl_usd    = avg_price * total_contracts * (pnl_pct / 100) * 10
+        close_side  = 'sell' if side == 'buy' else 'buy'
+        pos_side    = 'long' if side == 'buy' else 'short'
+
+        # OKX'ten gerçek PnL
+        okx_positions = okx.fetch_positions([symbol])
+        real_pnl_usd  = 0.0
+        real_pnl_pct  = 0.0
+        cur_price     = None
+        for p in okx_positions:
+            if p and float(p.get('contracts', 0) or 0) > 0:
+                cur_price    = float(p.get('markPrice', 0) or 0)
+                real_pnl_usd = float(p.get('unrealizedPnl', 0) or 0)
+                real_pnl_pct = float(p.get('percentage', 0) or 0)
+                break
+        if not cur_price:
+            ticker    = okx.fetch_ticker(symbol)
+            cur_price = ticker['last']
+
         okx.create_market_order(
             symbol=symbol, side=close_side, amount=total_contracts,
             params={"posSide": pos_side, "reduceOnly": True}
@@ -786,16 +899,16 @@ def close_position():
             f"🛑 <b>Manuel Kapatma</b>\n"
             f"Sembol: <b>{sym_short}</b>\n"
             f"Fiyat: ${cur_price:.4f}\n"
-            f"PnL: {'+' if pnl_usd>=0 else ''}${pnl_usd:.2f} USDT ({fmt_pct(pnl_pct)}%)"
+            f"PnL: {'+' if real_pnl_usd>=0 else ''}${real_pnl_usd:.2f} USDT ({fmt_pct(real_pnl_pct)}%)"
         )
         conn2  = sqlite3.connect('bot_settings.db')
         cur2   = conn2.cursor()
         cur2.execute("INSERT INTO trades (symbol,side,status,pnl,closed_at) VALUES (?,?,?,?,?)",
-                     (symbol, side, 'MANUEL', round(pnl_usd, 2), datetime.now().strftime('%Y-%m-%d %H:%M')))
+                     (symbol, side, 'MANUEL', round(real_pnl_usd, 2), datetime.now().strftime('%Y-%m-%d %H:%M')))
         cur2.execute("DELETE FROM active_positions WHERE symbol=?", (symbol,))
         conn2.commit()
         conn2.close()
-        return jsonify({"status": "success", "message": f"{sym_short} kapatıldı | PnL: ${pnl_usd:.2f}"}), 200
+        return jsonify({"status": "success", "message": f"{sym_short} kapatıldı | PnL: ${real_pnl_usd:.2f}"}), 200
     except Exception as e:
         return jsonify({"status": "error", "message": str(e)}), 200
 
@@ -837,14 +950,13 @@ def webhook():
     if not okx:
         return jsonify({"status": "error", "message": "API anahtarlari eksik"}), 200
 
-    # load_markets tek seferde çağrılıyor
     try:
         okx.load_markets()
     except Exception as e:
         return jsonify({"status": "error", "message": f"Market yüklenemedi: {e}"}), 200
 
     # ================================================================
-    # YENİ: STEP 1 İÇİN FİBO MESAFE FİLTRESİ
+    # STEP 1 İÇİN FİBO MESAFE FİLTRESİ
     # ================================================================
     if step == 1:
         try:
@@ -855,7 +967,7 @@ def webhook():
                 passed, fail_step, fail_dist = check_fibo_distance(side, fhigh, flow, min_distance_filter)
                 if not passed:
                     sym_short = symbol.replace('/USDT:USDT', '')
-                    msg = (
+                    send_telegram(
                         f"🚫 <b>Fibo Mesafe Engeli</b>\n"
                         f"Sembol: <b>{sym_short}</b>\n"
                         f"Yön: {'LONG' if side=='buy' else 'SHORT'}\n"
@@ -863,8 +975,6 @@ def webhook():
                         f"Min gereken: %{min_distance_filter}\n"
                         f"❌ İşleme girilmedi"
                     )
-                    send_telegram(msg)
-                    print(f"🚫 {symbol} fibo mesafe engeli — Step{fail_step} arası %{fail_dist:.2f}")
                     return jsonify({
                         "status":   "ignored",
                         "message":  f"Fibo mesafe engeli: Step{fail_step} arası %{fail_dist:.2f} < min %{min_distance_filter}",
@@ -902,7 +1012,6 @@ def webhook():
                 return jsonify({"status": "ignored", "message": "Mesafe engeli"}), 200
 
     try:
-        okx.load_markets()
         try:
             okx.set_margin_mode('cross', symbol)
         except Exception as e:
@@ -930,7 +1039,7 @@ def webhook():
             final_qty = min_qty if min_qty else 1
 
         pos_side = "long" if side == "buy" else "short"
-        order = okx.create_market_order(
+        order    = okx.create_market_order(
             symbol=symbol, side=side, amount=final_qty,
             params={"posSide": pos_side}
         )
