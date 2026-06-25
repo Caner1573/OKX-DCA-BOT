@@ -11,7 +11,7 @@ import math
 import threading
 import time
 import requests
-from datetime import datetime
+from datetime import datetime, timedelta
 
 app = Flask(__name__)
 
@@ -142,6 +142,123 @@ def get_daily_stats():
         conn.close()
     return acilan, kapanan, acik, tp1, tp2, sl, tp2_bekliyor
 
+def get_pnl_analytics(range_key):
+    """
+    trades tablosundan range_key'e göre gruplanmış PnL analitiği döndürür.
+    24h -> saatlik noktalar (son 24 saat)
+    diğerleri -> günlük satırlar (tarih, işlem sayısı, kazanan, kaybeden, pnl, kümülatif)
+    """
+    conn = sqlite3.connect('bot_settings.db')
+    cursor = conn.cursor()
+
+    range_days_map = {
+        '24h': 1, '7d': 7, '14d': 14, '30d': 30,
+        '90d': 90, '180d': 180, '365d': 365, 'all': None
+    }
+    days = range_days_map.get(range_key, 7)
+
+    try:
+        if range_key == '24h':
+            since = (datetime.now() - timedelta(hours=24)).strftime('%Y-%m-%d %H:%M')
+            cursor.execute("""
+                SELECT strftime('%Y-%m-%d %H:00', closed_at) as bucket,
+                       COUNT(*), SUM(CASE WHEN pnl > 0 THEN 1 ELSE 0 END),
+                       SUM(CASE WHEN pnl <= 0 THEN 1 ELSE 0 END), SUM(pnl)
+                FROM trades
+                WHERE closed_at >= ?
+                GROUP BY bucket
+                ORDER BY bucket ASC
+            """, (since,))
+            raw = cursor.fetchall()
+            rows = []
+            cum = 0.0
+            for bucket, cnt, wins, losses, pnl in raw:
+                pnl = pnl or 0.0
+                cum += pnl
+                try:
+                    dt = datetime.strptime(bucket, '%Y-%m-%d %H:00')
+                    label = dt.strftime('%H:00')
+                    sub = dt.strftime('%d %b')
+                except:
+                    label, sub = bucket, ''
+                rows.append({
+                    'label': label, 'sub': sub, 'trades': cnt,
+                    'wins': wins or 0, 'losses': losses or 0,
+                    'pnl': round(pnl, 2), 'cum': round(cum, 2),
+                    'is_today': False
+                })
+        else:
+            if days:
+                since = (datetime.now() - timedelta(days=days)).strftime('%Y-%m-%d')
+                cursor.execute("""
+                    SELECT substr(closed_at,1,10) as d,
+                           COUNT(*), SUM(CASE WHEN pnl > 0 THEN 1 ELSE 0 END),
+                           SUM(CASE WHEN pnl <= 0 THEN 1 ELSE 0 END), SUM(pnl)
+                    FROM trades
+                    WHERE closed_at >= ?
+                    GROUP BY d
+                    ORDER BY d ASC
+                """, (since,))
+            else:
+                cursor.execute("""
+                    SELECT substr(closed_at,1,10) as d,
+                           COUNT(*), SUM(CASE WHEN pnl > 0 THEN 1 ELSE 0 END),
+                           SUM(CASE WHEN pnl <= 0 THEN 1 ELSE 0 END), SUM(pnl)
+                    FROM trades
+                    WHERE closed_at IS NOT NULL
+                    GROUP BY d
+                    ORDER BY d ASC
+                """)
+            raw = cursor.fetchall()
+            rows = []
+            cum = 0.0
+            gun_isimleri = ['Pazartesi','Salı','Çarşamba','Perşembe','Cuma','Cumartesi','Pazar']
+            today_str = datetime.now().strftime('%Y-%m-%d')
+            for d, cnt, wins, losses, pnl in raw:
+                if not d:
+                    continue
+                pnl = pnl or 0.0
+                cum += pnl
+                try:
+                    dt = datetime.strptime(d, '%Y-%m-%d')
+                    label = dt.strftime('%d %b')
+                    sub = gun_isimleri[dt.weekday()]
+                except:
+                    label, sub = d, ''
+                rows.append({
+                    'label': label, 'sub': sub, 'trades': cnt,
+                    'wins': wins or 0, 'losses': losses or 0,
+                    'pnl': round(pnl, 2), 'cum': round(cum, 2),
+                    'is_today': (d == today_str)
+                })
+
+        total_pnl    = rows[-1]['cum'] if rows else 0.0
+        total_trades = sum(r['trades'] for r in rows)
+        total_wins   = sum(r['wins'] for r in rows)
+        win_rate     = (total_wins / total_trades * 100) if total_trades > 0 else 0.0
+        best_row     = max(rows, key=lambda r: r['pnl']) if rows else None
+        worst_row    = min(rows, key=lambda r: r['pnl']) if rows else None
+
+        return {
+            'rows': list(reversed(rows)),
+            'chart_labels': [r['label'] for r in rows],
+            'chart_cum': [r['cum'] for r in rows],
+            'total_pnl': round(total_pnl, 2),
+            'total_trades': total_trades,
+            'win_rate': round(win_rate, 1),
+            'best': {'label': best_row['label'], 'pnl': best_row['pnl']} if best_row else None,
+            'worst': {'label': worst_row['label'], 'pnl': worst_row['pnl']} if worst_row else None,
+        }
+    except Exception as e:
+        print(f"⚠️ PnL analitik hatası: {e}")
+        return {
+            'rows': [], 'chart_labels': [], 'chart_cum': [],
+            'total_pnl': 0, 'total_trades': 0, 'win_rate': 0,
+            'best': None, 'worst': None
+        }
+    finally:
+        conn.close()
+
 init_db()
 
 def get_okx():
@@ -172,7 +289,7 @@ def get_okx_positions():
             if not pos or float(pos.get('contracts', 0) or 0) == 0:
                 continue
             symbol     = pos.get('symbol', '')
-            side       = pos.get('side', '')        # 'long' veya 'short'
+            side       = pos.get('side', '')
             entry      = float(pos.get('entryPrice', 0) or 0)
             mark       = float(pos.get('markPrice', 0) or 0)
             pnl_usd    = float(pos.get('unrealizedPnl', 0) or 0)
@@ -192,10 +309,6 @@ def get_okx_positions():
     except Exception as e:
         print(f"⚠️ OKX pozisyon çekme hatası: {e}")
         return {}
-
-# ================================================================
-# FİBO HESAPLAMA VE KONTROL
-# ================================================================
 
 def get_previous_day_hl(okx, symbol):
     try:
@@ -241,8 +354,6 @@ def check_fibo_distance(side, fhigh, flow, min_dist_pct):
             return False, i + 1, dist
     print(f"  ✅ Tüm fibo adımları min %{min_dist_pct} üstünde")
     return True, None, None
-
-# ================================================================
 
 def self_ping():
     while True:
@@ -294,7 +405,6 @@ def tp_monitor():
                         continue
                     okx.load_markets()
 
-                    # OKX'ten gerçek fiyat ve PnL
                     okx_positions = okx.fetch_positions([symbol])
                     cur_price     = None
                     real_pnl_usd  = None
@@ -432,16 +542,12 @@ def dashboard_data():
     total, win_rate, total_pnl = get_stats()
     acilan, kapanan, acik, tp1, tp2, sl, tp2_bekliyor = get_daily_stats()
 
-    # DB'den takip bilgileri
     conn = sqlite3.connect('bot_settings.db')
     cursor = conn.cursor()
     cursor.execute("SELECT symbol, side, avg_entry_price, total_contracts, current_step, tp1_done, tp2_done, sl_active FROM active_positions")
     active_pos = cursor.fetchall()
-    cursor.execute("SELECT pnl, recorded_at FROM pnl_history ORDER BY id DESC LIMIT 24")
-    pnl_rows = cursor.fetchall()
     conn.close()
 
-    # OKX'ten gerçek pozisyon verileri
     okx_pos = get_okx_positions()
 
     positions = []
@@ -449,7 +555,6 @@ def dashboard_data():
         symbol, side, avg_price, contracts, step, tp1_done, tp2_done, sl_active = p
         okx = okx_pos.get(symbol, {})
 
-        # OKX'ten gelen gerçek değerler, yoksa DB'deki değer
         real_entry   = okx.get('entryPrice', avg_price) or avg_price
         real_mark    = okx.get('markPrice',  avg_price) or avg_price
         real_pnl_usd = okx.get('pnlUsd',     0.0)
@@ -472,9 +577,6 @@ def dashboard_data():
             "slPrice":   real_entry,
         })
 
-    pnl_labels = [r[1] for r in reversed(pnl_rows)]
-    pnl_data   = [round(r[0], 2) for r in reversed(pnl_rows)]
-
     return jsonify({
         "total":        total,
         "win_rate":     round(win_rate, 1),
@@ -487,10 +589,17 @@ def dashboard_data():
         "sl":           sl,
         "tp2_bekliyor": tp2_bekliyor,
         "positions":    positions,
-        "pnl_labels":   pnl_labels,
-        "pnl_data":     pnl_data,
         "today":        datetime.now().strftime('%d %b %Y'),
     })
+
+@app.route('/pnl_analytics', methods=['GET'])
+def pnl_analytics():
+    range_key = request.args.get('range', '7d')
+    valid_ranges = ['24h', '7d', '14d', '30d', '90d', '180d', '365d', 'all']
+    if range_key not in valid_ranges:
+        range_key = '7d'
+    data = get_pnl_analytics(range_key)
+    return jsonify(data), 200
 
 @app.route('/', methods=['GET'])
 def dashboard():
@@ -522,14 +631,14 @@ def dashboard():
 <script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.js"></script>
 <style>
 *{box-sizing:border-box;margin:0;padding:0}
-body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;background:#0d0d0f;color:#e0e0e0;padding:12px}
+body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;background:#0d0d0f;color:#e0e0e0;padding:12px;font-variant-numeric:tabular-nums}
 .header{text-align:center;padding:16px 0 20px;font-size:1.05rem;font-weight:700;color:#4caf50;letter-spacing:1px}
 .stats{display:grid;grid-template-columns:repeat(3,1fr);gap:8px;margin-bottom:14px}
 .stat{background:#16161a;border:1px solid #222;border-radius:10px;padding:12px 8px;text-align:center}
 .stat .val{font-size:1.15rem;font-weight:700;color:#4caf50}
 .stat .lbl{font-size:0.65rem;color:#555;margin-top:3px;text-transform:uppercase;letter-spacing:.5px}
 .card{background:#16161a;border:1px solid #222;border-radius:10px;padding:14px;margin-bottom:12px}
-.card h2{font-size:0.78rem;color:#4caf50;text-transform:uppercase;letter-spacing:.8px;margin-bottom:12px;padding-bottom:8px;border-bottom:1px solid #222}
+.card h2{font-size:0.78rem;color:#4caf50;text-transform:uppercase;letter-spacing:.8px;margin-bottom:12px;padding-bottom:8px;border-bottom:1px solid #222;display:flex;align-items:center;justify-content:space-between}
 .pos-card{background:#1a1a1e;border:1px solid #2a2a2e;border-radius:10px;margin-bottom:10px;overflow:hidden}
 .pos-header{display:flex;align-items:center;justify-content:space-between;padding:10px 14px 8px}
 .sym{font-size:14px;font-weight:600;color:#fff}
@@ -544,7 +653,7 @@ body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;backgrou
 .clabel{font-size:9px;color:#555;text-transform:uppercase;letter-spacing:.5px;margin-bottom:2px}
 .cval{font-size:12px;font-weight:600;color:#e0e0e0}
 .pos-val{color:#4caf50}
-.neg-val{color:#f44336}
+.neg-val{color:#ff5252}
 .neu-val{color:#888}
 .pnl-bar-wrap{padding:8px 14px 10px}
 .pnl-bar-label{display:flex;justify-content:space-between;font-size:9px;color:#555;margin-bottom:4px}
@@ -576,6 +685,50 @@ input:focus{outline:none;border-color:#4caf50}
 .daily-row:last-child{border-bottom:none}
 .daily-label{font-size:12px;color:#666}
 .daily-val{font-size:18px;font-weight:700}
+
+/* ---- PNL ANALİTİK PANELİ ---- */
+.range-select{position:relative}
+.range-select select{
+  background:#0d0d0f;border:1px solid #2a2a2e;color:#e0e0e0;font-size:0.68rem;
+  padding:6px 26px 6px 10px;border-radius:7px;text-transform:none;letter-spacing:0;
+  font-weight:600;appearance:none;cursor:pointer;
+}
+.range-select::after{
+  content:'▾';position:absolute;right:9px;top:50%;transform:translateY(-50%);
+  color:#4caf50;font-size:9px;pointer-events:none;
+}
+.summary-grid{display:grid;grid-template-columns:repeat(2,1fr);gap:8px;margin-bottom:14px}
+.sum-cell{background:#1a1a1e;border:1px solid #2a2a2e;border-radius:10px;padding:11px 10px}
+.sum-cell .lbl{font-size:0.6rem;color:#555;text-transform:uppercase;letter-spacing:.5px;margin-bottom:5px}
+.sum-cell .val{font-size:1.0rem;font-weight:700;letter-spacing:-.2px}
+.sum-cell .sub{font-size:0.6rem;color:#444;margin-top:3px}
+.chart-wrap{position:relative;height:200px;margin-bottom:14px}
+.tbl-scroll{max-height:420px;overflow-y:auto;border-radius:8px}
+.tbl-scroll::-webkit-scrollbar{width:6px}
+.tbl-scroll::-webkit-scrollbar-thumb{background:#2a2a2e;border-radius:3px}
+.pnl-table{width:100%;border-collapse:collapse;font-size:0.74rem}
+.pnl-table thead th{
+  position:sticky;top:0;background:#1a1a1e;color:#666;text-transform:uppercase;
+  font-size:0.58rem;letter-spacing:.5px;font-weight:600;text-align:right;padding:8px 6px;
+  border-bottom:1px solid #2a2a2e;z-index:1;
+}
+.pnl-table thead th:first-child{text-align:left;padding-left:14px}
+.pnl-table tbody td{padding:8px 6px;text-align:right;border-bottom:1px solid #1c1c20;white-space:nowrap;font-size:0.74rem}
+.pnl-table tbody td:first-child{text-align:left;padding-left:14px;position:relative}
+.pnl-table tbody tr:hover{background:#1a1a1e}
+.pnl-table tbody tr:last-child td{border-bottom:none}
+.pulse-bar{position:absolute;left:0;top:6px;bottom:6px;width:3px;border-radius:2px}
+.date-main{font-weight:600;color:#ddd;display:block;font-size:0.76rem}
+.date-sub{font-size:0.58rem;color:#555;display:block;margin-top:1px}
+.wr-pill{display:inline-block;padding:2px 6px;border-radius:20px;font-size:0.62rem;font-weight:600}
+.wr-high{background:#0a2a0a;color:#4caf50}
+.wr-mid{background:#2a2a0a;color:#ffc107}
+.wr-low{background:#2a0a0a;color:#ff5252}
+.mini-bar-bg{width:38px;height:4px;background:#222;border-radius:3px;overflow:hidden;display:inline-block;vertical-align:middle;margin-left:5px}
+.mini-bar-fill{height:100%;border-radius:3px}
+.today-row td:first-child .date-main{color:#4caf50}
+.today-tag{font-size:0.52rem;background:#0a2a0a;color:#4caf50;padding:1px 5px;border-radius:4px;margin-left:5px;font-weight:700;letter-spacing:.3px}
+.footnote{font-size:0.62rem;color:#444;text-align:center;padding-top:10px}
 </style>
 </head><body>
 
@@ -611,10 +764,65 @@ input:focus{outline:none;border-color:#4caf50}
 </div>
 
 <div class="card">
-  <h2>📈 PnL Geçmişi (Son 24 Saat)</h2>
-  <div style="position:relative;height:160px">
-    <canvas id="pnlChart" role="img" aria-label="PnL geçmiş grafiği"></canvas>
+  <h2>
+    <span>📊 PnL Analitiği</span>
+    <span class="range-select">
+      <select id="rangeSel">
+        <option value="24h">Son 24 Saat</option>
+        <option value="7d" selected>Son 7 Gün</option>
+        <option value="14d">Son 14 Gün</option>
+        <option value="30d">Son 30 Gün</option>
+        <option value="90d">Son 90 Gün</option>
+        <option value="180d">Son 6 Ay</option>
+        <option value="365d">Son 1 Yıl</option>
+        <option value="all">Tüm Zamanlar</option>
+      </select>
+    </span>
+  </h2>
+
+  <div class="summary-grid">
+    <div class="sum-cell">
+      <div class="lbl">Dönem PnL</div>
+      <div class="val" id="pa-total">-</div>
+      <div class="sub" id="pa-total-sub">-</div>
+    </div>
+    <div class="sum-cell">
+      <div class="lbl">Win Rate</div>
+      <div class="val" id="pa-winrate" style="color:#e0e0e0">-</div>
+      <div class="sub" id="pa-winrate-sub">-</div>
+    </div>
+    <div class="sum-cell">
+      <div class="lbl">En İyi Gün</div>
+      <div class="val pos-val" id="pa-best">-</div>
+      <div class="sub" id="pa-best-sub">-</div>
+    </div>
+    <div class="sum-cell">
+      <div class="lbl">En Kötü Gün</div>
+      <div class="val neg-val" id="pa-worst">-</div>
+      <div class="sub" id="pa-worst-sub">-</div>
+    </div>
   </div>
+
+  <div class="chart-wrap">
+    <canvas id="cumChart"></canvas>
+  </div>
+
+  <div class="tbl-scroll">
+  <table class="pnl-table">
+    <thead>
+      <tr>
+        <th>Tarih</th>
+        <th>İşlem</th>
+        <th>K/Z</th>
+        <th>Win%</th>
+        <th>PnL</th>
+        <th>Kümülatif</th>
+      </tr>
+    </thead>
+    <tbody id="paTblBody"><tr><td colspan="6" class="no-pos">Yükleniyor...</td></tr></tbody>
+  </table>
+  </div>
+  <div class="footnote" id="pa-footnote">veriler her saat güncellenir</div>
 </div>
 
 <div class="card">
@@ -652,11 +860,11 @@ input:focus{outline:none;border-color:#4caf50}
 </form>
 
 <script>
-let pnlChart = null;
+let cumChart = null;
 
 function fmtU(n){
   const abs = Math.abs(n).toFixed(2);
-  return (n >= 0 ? '+$' : '-$') + abs;
+  return (n >= 0 ? '+$' : '−$') + abs;
 }
 function fmt(n, d=2){
   return (n >= 0 ? '+' : '') + n.toFixed(d);
@@ -673,7 +881,7 @@ function renderPositions(positions){
     const isPos  = p.pnlUsd >= 0;
     const cls    = isPos ? 'pos-val' : 'neg-val';
     const barW   = Math.min(Math.abs(p.pnlPct) * 5, 100);
-    const barClr = isPos ? '#4caf50' : '#f44336';
+    const barClr = isPos ? '#4caf50' : '#ff5252';
     const sym    = p.symbol.replace('/USDT:USDT','');
 
     const tp1_pct  = p.side === 'buy' ? 1.015 : 0.985;
@@ -681,7 +889,6 @@ function renderPositions(positions){
     const tp1Price = (p.avgPrice * tp1_pct).toFixed(4);
     const tp2Price = (p.avgPrice * tp2_pct).toFixed(4);
 
-    // TP1'e kalan mesafe
     const tp1Target = p.side === 'buy' ? p.avgPrice * 1.015 : p.avgPrice * 0.985;
     const distToTp1 = p.side === 'buy'
       ? (tp1Target - p.markPrice) / p.markPrice * 100
@@ -726,45 +933,156 @@ function renderPositions(positions){
   container.innerHTML = html;
 }
 
-function updatePnlChart(labels, data){
-  if(data.length <= 1){
-    document.getElementById('pnlChart').parentElement.innerHTML =
-      '<div class="no-pos" style="padding:40px">Yeterli veri yok — grafik saatlik kaydedilir</div>';
+function winRateClass(wr){
+  if(wr >= 60) return 'wr-high';
+  if(wr >= 45) return 'wr-mid';
+  return 'wr-low';
+}
+
+function renderPnlAnalytics(data){
+  // özet kartlar
+  const totalEl = document.getElementById('pa-total');
+  totalEl.textContent = fmtU(data.total_pnl);
+  totalEl.className = 'val ' + (data.total_pnl >= 0 ? 'pos-val' : 'neg-val');
+  document.getElementById('pa-total-sub').textContent = data.total_trades + ' işlemde';
+
+  document.getElementById('pa-winrate').textContent = data.win_rate.toFixed(1) + '%';
+  document.getElementById('pa-winrate-sub').textContent = data.total_trades + ' işlem';
+
+  if(data.best){
+    document.getElementById('pa-best').textContent = fmtU(data.best.pnl);
+    document.getElementById('pa-best-sub').textContent = data.best.label;
+  } else {
+    document.getElementById('pa-best').textContent = '—';
+    document.getElementById('pa-best-sub').textContent = 'veri yok';
+  }
+  if(data.worst){
+    document.getElementById('pa-worst').textContent = fmtU(data.worst.pnl);
+    document.getElementById('pa-worst-sub').textContent = data.worst.label;
+  } else {
+    document.getElementById('pa-worst').textContent = '—';
+    document.getElementById('pa-worst-sub').textContent = 'veri yok';
+  }
+
+  // tablo
+  const tbody = document.getElementById('paTblBody');
+  if(!data.rows.length){
+    tbody.innerHTML = '<tr><td colspan="6" class="no-pos">Bu aralıkta kapanmış işlem yok</td></tr>';
+  } else {
+    const maxAbs = Math.max(...data.rows.map(r => Math.abs(r.pnl)), 0.01);
+    let html = '';
+    data.rows.forEach(r => {
+      const isPos = r.pnl >= 0;
+      const barColor = isPos ? '#4caf50' : '#ff5252';
+      const barWidth = Math.abs(r.pnl) / maxAbs * 100;
+      const wr = r.trades ? (r.wins / r.trades * 100) : 0;
+      html += `
+      <tr class="${r.is_today ? 'today-row' : ''}">
+        <td>
+          <div class="pulse-bar" style="background:${barColor};opacity:${0.35 + (barWidth/100)*0.65}"></div>
+          <span class="date-main">${r.label}${r.is_today ? '<span class="today-tag">CANLI</span>' : ''}</span>
+          <span class="date-sub">${r.sub}</span>
+        </td>
+        <td>${r.trades}</td>
+        <td><span class="pos-val">${r.wins}W</span>/<span class="neg-val">${r.losses}L</span></td>
+        <td><span class="wr-pill ${winRateClass(wr)}">${wr.toFixed(0)}%</span></td>
+        <td class="${isPos ? 'pos-val' : 'neg-val'}" style="font-weight:700">
+          ${fmtU(r.pnl)}
+          <span class="mini-bar-bg"><span class="mini-bar-fill" style="width:${barWidth}%;background:${barColor}"></span></span>
+        </td>
+        <td class="${r.cum >= 0 ? 'pos-val' : 'neg-val'}">${fmtU(r.cum)}</td>
+      </tr>`;
+    });
+    tbody.innerHTML = html;
+  }
+
+  // grafik
+  const ctx = document.getElementById('cumChart');
+  const gradient = ctx.getContext('2d').createLinearGradient(0,0,0,200);
+  const isOverallPos = data.total_pnl >= 0;
+  if(isOverallPos){
+    gradient.addColorStop(0, 'rgba(76,175,80,0.35)');
+    gradient.addColorStop(1, 'rgba(76,175,80,0.0)');
+  } else {
+    gradient.addColorStop(0, 'rgba(255,82,82,0.35)');
+    gradient.addColorStop(1, 'rgba(255,82,82,0.0)');
+  }
+  const lineColor = isOverallPos ? '#4caf50' : '#ff5252';
+
+  if(!data.chart_cum.length){
+    if(cumChart){ cumChart.destroy(); cumChart = null; }
+    ctx.getContext('2d').clearRect(0,0,ctx.width,ctx.height);
     return;
   }
-  if(pnlChart){
-    pnlChart.data.labels = labels;
-    pnlChart.data.datasets[0].data = data;
-    pnlChart.update();
+
+  if(cumChart){
+    cumChart.data.labels = data.chart_labels;
+    cumChart.data.datasets[0].data = data.chart_cum;
+    cumChart.data.datasets[0].borderColor = lineColor;
+    cumChart.data.datasets[0].pointBorderColor = lineColor;
+    cumChart.data.datasets[0].backgroundColor = gradient;
+    cumChart.update();
   } else {
-    pnlChart = new Chart(document.getElementById('pnlChart'), {
+    cumChart = new Chart(ctx, {
       type: 'line',
       data: {
-        labels,
-        datasets:[{
-          label: 'PnL (USDT)',
-          data,
-          borderColor: '#4caf50',
-          backgroundColor: 'rgba(76,175,80,0.08)',
-          borderWidth: 2,
+        labels: data.chart_labels,
+        datasets: [{
+          label: 'Kümülatif PnL',
+          data: data.chart_cum,
+          borderColor: lineColor,
+          backgroundColor: gradient,
+          borderWidth: 2.5,
           pointRadius: 3,
-          pointBackgroundColor: '#4caf50',
+          pointBackgroundColor: '#0d0d0f',
+          pointBorderColor: lineColor,
+          pointBorderWidth: 2,
+          pointHoverRadius: 6,
           fill: true,
-          tension: 0.4
+          tension: 0.35,
         }]
       },
-      options:{
+      options: {
         responsive: true,
         maintainAspectRatio: false,
-        plugins:{ legend:{ display:false } },
-        scales:{
-          x:{ ticks:{ color:'#555', font:{ size:9 } }, grid:{ color:'#1a1a1e' } },
-          y:{ ticks:{ color:'#555', font:{ size:9 }, callback: v => '$'+v }, grid:{ color:'#1a1a1e' } }
+        interaction: { intersect: false, mode: 'index' },
+        plugins: {
+          legend: { display: false },
+          tooltip: {
+            backgroundColor: '#1a1a1e',
+            borderColor: '#2a2a2e',
+            borderWidth: 1,
+            titleColor: '#888',
+            bodyColor: lineColor,
+            bodyFont: { weight: '700' },
+            padding: 10,
+            callbacks: {
+              label: (ctx) => 'Kümülatif: ' + fmtU(ctx.parsed.y)
+            }
+          }
+        },
+        scales: {
+          x: { ticks: { color: '#555', font: { size: 9 } }, grid: { color: '#1a1a1e' } },
+          y: { ticks: { color: '#555', font: { size: 9 }, callback: v => '$'+v }, grid: { color: '#1a1a1e' } }
         }
       }
     });
   }
 }
+
+async function loadPnlAnalytics(range){
+  try{
+    const r = await fetch('/pnl_analytics?range=' + range);
+    const d = await r.json();
+    renderPnlAnalytics(d);
+  } catch(e){
+    console.error('PnL analitik hatası:', e);
+  }
+}
+
+document.getElementById('rangeSel').addEventListener('change', (e) => {
+  loadPnlAnalytics(e.target.value);
+});
 
 async function refreshAll(){
   try{
@@ -784,7 +1102,6 @@ async function refreshAll(){
     document.getElementById('d-tp2bek').textContent   = d.tp2_bekliyor;
 
     renderPositions(d.positions);
-    updatePnlChart(d.pnl_labels, d.pnl_data);
 
     document.getElementById('last-update').textContent =
       'Güncellendi: ' + new Date().toLocaleTimeString('tr-TR');
@@ -795,7 +1112,9 @@ async function refreshAll(){
 }
 
 refreshAll();
+loadPnlAnalytics(document.getElementById('rangeSel').value);
 setInterval(refreshAll, 30000);
+setInterval(() => loadPnlAnalytics(document.getElementById('rangeSel').value), 60000);
 
 function closePos(symbol, side){
   if(!confirm(symbol.replace('/USDT:USDT','')+' pozisyonunu kapatmak istediğine emin misin?')) return;
@@ -875,7 +1194,6 @@ def close_position():
         close_side  = 'sell' if side == 'buy' else 'buy'
         pos_side    = 'long' if side == 'buy' else 'short'
 
-        # OKX'ten gerçek PnL
         okx_positions = okx.fetch_positions([symbol])
         real_pnl_usd  = 0.0
         real_pnl_pct  = 0.0
@@ -955,9 +1273,6 @@ def webhook():
     except Exception as e:
         return jsonify({"status": "error", "message": f"Market yüklenemedi: {e}"}), 200
 
-    # ================================================================
-    # STEP 1 İÇİN FİBO MESAFE FİLTRESİ
-    # ================================================================
     if step == 1:
         try:
             fhigh, flow = get_previous_day_hl(okx, symbol)
@@ -984,7 +1299,6 @@ def webhook():
                     }), 200
         except Exception as e:
             print(f"⚠️ Fibo kontrol hatası, devam ediliyor: {e}")
-    # ================================================================
 
     conn   = sqlite3.connect('bot_settings.db')
     cursor = conn.cursor()
