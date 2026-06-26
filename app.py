@@ -287,8 +287,31 @@ def get_okx():
         'enableRateLimit': True
     })
 
+def round_amount_to_precision(okx, symbol, amount):
+    """
+    Miktarı OKX'in kabul ettiği hassasiyete yuvarlar (her zaman aşağı yuvarlar,
+    böylece borsanın kabul etmeyeceği bir üst değer asla gönderilmez).
+    Sonuç borsanın minimum kontrat eşiğinin altındaysa 0 döner (emir gönderilmemeli demektir).
+    """
+    try:
+        market = okx.market(symbol)
+        precision = market['precision']['amount']
+        min_qty = market['limits']['amount']['min'] or 0
+        if precision and precision > 0:
+            d = int(round(-math.log10(precision)))
+            rounded = math.floor(amount * (10 ** d)) / (10 ** d)
+        else:
+            rounded = math.floor(amount)
+        if min_qty and rounded < min_qty:
+            return 0.0
+        return rounded
+    except Exception as e:
+        print(f"⚠️ Precision yuvarlama hatası {symbol}: {e}")
+        return amount  # son çare: yuvarlamadan dön, en azından emir denensin
+
 def get_okx_positions():
-    """OKX'ten gerçek pozisyon verilerini çeker"""
+    """OKX'ten TÜM açık pozisyonları TEK seferde çeker, sembol -> veri sözlüğü döner.
+    Bu, çok sayıda pozisyon varken sembol-sembol API çağırmaktan (rate-limit riski) kaçınır."""
     try:
         okx = get_okx()
         if not okx:
@@ -314,22 +337,12 @@ def get_okx_positions():
                 'sizeUsd':    round(abs(size_usd), 2),
                 'contracts':  contracts,
                 'side':       side,
+                'raw':        pos,
             }
         return result
     except Exception as e:
         print(f"⚠️ OKX pozisyon çekme hatası: {e}")
         return {}
-
-def get_okx_position_for_symbol(okx, symbol):
-    """Belirli bir sembol için OKX'teki gerçek pozisyonu döndürür (varsa), yoksa None."""
-    try:
-        positions = okx.fetch_positions([symbol])
-        for p in positions:
-            if p and float(p.get('contracts', 0) or 0) > 0:
-                return p
-    except Exception as e:
-        print(f"⚠️ OKX pozisyon kontrol hatası {symbol}: {e}")
-    return None
 
 def get_previous_day_hl(okx, symbol):
     try:
@@ -421,6 +434,7 @@ def close_full_position_in_db(symbol, side, status, pnl_usd):
         return True
     except Exception as e:
         print(f"❌ DB GÜNCELLEME HATASI ({symbol}, {status}): {e}")
+        send_telegram(f"❌ DB HATASI: {symbol} ({status}) kaydedilemedi: {e}")
         return False
 
 def update_partial_position_in_db(symbol, **fields):
@@ -436,7 +450,30 @@ def update_partial_position_in_db(symbol, **fields):
         return True
     except Exception as e:
         print(f"❌ DB GÜNCELLEME HATASI (partial, {symbol}): {e}")
+        send_telegram(f"❌ DB HATASI: {symbol} kısmi güncelleme başarısız: {e}")
         return False
+
+def safe_close_order(okx, symbol, close_side, pos_side, amount):
+    """
+    reduceOnly market emri gönderir, ama önce miktarı precision'a yuvarlar.
+    Yuvarlanan miktar 0 ise (borsanın min eşiğinin altında kaldıysa) emir GÖNDERMEZ,
+    sadece bunu (True, 0) olarak işaretler ki çağıran taraf pozisyonu DB'den temizleyebilsin.
+    Dönen: (basarili: bool, gonderilen_miktar: float)
+    """
+    rounded = round_amount_to_precision(okx, symbol, amount)
+    if rounded <= 0:
+        print(f"ℹ️ {symbol}: kalan miktar ({amount}) borsa min eşiğinin altında, emir gönderilmiyor, DB temizlenecek")
+        return True, 0.0
+    try:
+        okx.create_market_order(
+            symbol=symbol, side=close_side, amount=rounded,
+            params={"posSide": pos_side, "reduceOnly": True}
+        )
+        return True, rounded
+    except Exception as e:
+        print(f"❌ Emir hatası {symbol}: {e}")
+        send_telegram(f"❌ {symbol.replace('/USDT:USDT','')} kapatma emri BAŞARISIZ: {e}")
+        return False, 0.0
 
 def tp_monitor():
     while True:
@@ -447,71 +484,74 @@ def tp_monitor():
             positions = cursor.fetchall()
             conn.close()
 
+            if not positions:
+                time.sleep(10)
+                continue
+
+            okx = get_okx()
+            if not okx:
+                time.sleep(10)
+                continue
+
+            try:
+                okx.load_markets()
+            except Exception as e:
+                print(f"⚠️ Market yüklenemedi (tp_monitor): {e}")
+                time.sleep(10)
+                continue
+
+            # TEK seferde tüm pozisyonları çek (rate-limit güvenli, sembol sayısından bağımsız hızlı)
+            okx_positions_map = get_okx_positions()
+
+            tp1_pct_roi = float(get_setting('tp1_pct', 1.5))   # artık KALDIRAÇLI ROI yüzdesi
+            tp2_pct_roi = float(get_setting('tp2_pct', 3.0))
+            tp1_qty     = float(get_setting('tp1_qty', 50)) / 100
+
             for pos in positions:
                 symbol, side, avg_price, total_contracts, tp1_done, tp2_done, sl_active, realized_pnl = pos
                 if not avg_price or avg_price == 0:
                     continue
                 if not total_contracts or total_contracts == 0:
                     continue
-                try:
-                    okx = get_okx()
-                    if not okx:
-                        continue
-                    okx.load_markets()
 
-                    # OKX'te bu sembol için gerçekten açık pozisyon var mı? (manuel kapatılmış olabilir)
-                    real_pos = get_okx_position_for_symbol(okx, symbol)
-                    if not real_pos:
+                try:
+                    okx_pos = okx_positions_map.get(symbol)
+
+                    if not okx_pos:
                         # Borsada pozisyon yok ama DB'de hâlâ "açık" görünüyor demek ki manuel/başka yoldan
                         # kapanmış ve DB güncellenememiş. DB'yi senkronize et, sessizce kayıp PnL bırakma.
                         print(f"ℹ️ {symbol} borsada bulunamadı, DB'den temizleniyor (muhtemelen manuel kapatılmış)")
-                        # TP1 sonrası gelen manuel kapamada da realized_pnl'i koru
                         fallback_pnl = realized_pnl or 0.0
                         status = 'SL_BREAKEVEN' if tp1_done else 'MANUEL_SENKRON'
                         close_full_position_in_db(symbol, side, status, fallback_pnl)
                         continue
 
-                    cur_price    = float(real_pos.get('markPrice', 0) or 0)
-                    real_pnl_usd = float(real_pos.get('unrealizedPnl', 0) or 0)
-                    real_pnl_pct = float(real_pos.get('percentage', 0) or 0)
+                    cur_price    = okx_pos['markPrice']
+                    real_pnl_usd = okx_pos['pnlUsd']
+                    real_pnl_pct = okx_pos['pnlPct']  # OKX'in verdiği KALDIRAÇLI ROI %
 
                     if not cur_price:
-                        ticker    = okx.fetch_ticker(symbol)
-                        cur_price = ticker['last']
+                        continue
 
-                    tp1_pct = float(get_setting('tp1_pct', 1.5)) / 100
-                    tp2_pct = float(get_setting('tp2_pct', 3.0)) / 100
-                    tp1_qty = float(get_setting('tp1_qty', 50)) / 100
-
-                    if side == 'buy':
-                        tp1_price = avg_price * (1 + tp1_pct)
-                        tp2_price = avg_price * (1 + tp2_pct)
-                        hit_tp1   = cur_price >= tp1_price
-                        hit_tp2   = cur_price >= tp2_price
-                        hit_sl    = sl_active and (cur_price <= avg_price)
-                    else:
-                        tp1_price = avg_price * (1 - tp1_pct)
-                        tp2_price = avg_price * (1 - tp2_pct)
-                        hit_tp1   = cur_price <= tp1_price
-                        hit_tp2   = cur_price <= tp2_price
-                        hit_sl    = sl_active and (cur_price >= avg_price)
+                    # --- ROI BAZLI TP/SL: artık fiyat farkı değil, OKX'in kaldıraçlı ROI%'si kullanılır ---
+                    hit_tp1 = real_pnl_pct >= tp1_pct_roi
+                    hit_tp2 = real_pnl_pct >= tp2_pct_roi
+                    # Breakeven SL: TP1 sonrası, fiyat giriş ortalamasına geri dönerse (ROI ~0 veya altı)
+                    hit_sl  = bool(sl_active) and (real_pnl_pct <= 0)
 
                     close_side  = 'sell' if side == 'buy' else 'buy'
                     pos_side    = 'long' if side == 'buy' else 'short'
-                    pnl_usd     = real_pnl_usd if real_pnl_usd is not None else 0
-                    pnl_pct_val = real_pnl_pct if real_pnl_pct is not None else 0
+                    pnl_usd     = real_pnl_usd
 
-                    print(f"👁 {symbol} | Fiyat:{cur_price} | Ort:{avg_price:.4f} | PnL:{pnl_usd:.2f} | SL_Aktif:{bool(sl_active)} | Birikmiş:{realized_pnl or 0:.2f}")
+                    print(f"👁 {symbol} | Fiyat:{cur_price} | Ort:{avg_price:.6f} | ROI:%{real_pnl_pct:.2f} | PnL:{pnl_usd:.2f} | SL_Aktif:{bool(sl_active)} | Birikmiş:{realized_pnl or 0:.2f}")
 
                     # --- SL (BREAKEVEN): TP1 sonrası geldiği için her zaman WIN sayılır ---
                     if hit_sl and not tp2_done:
-                        okx.create_market_order(
-                            symbol=symbol, side=close_side, amount=total_contracts,
-                            params={"posSide": pos_side, "reduceOnly": True}
-                        )
+                        ok_order, sent_qty = safe_close_order(okx, symbol, close_side, pos_side, total_contracts)
+                        if not ok_order:
+                            continue  # emir başarısız oldu, bir sonraki turda tekrar denenecek
                         sym_short = symbol.replace('/USDT:USDT', '')
                         total_realized = (realized_pnl or 0) + pnl_usd
-                        # TP1 kârı gerçekleşmiş olduğu için bu satış WIN olarak işaretlenir (en az +0.01)
                         final_pnl = total_realized if total_realized > 0 else 0.01
                         ok = close_full_position_in_db(symbol, side, 'SL_BREAKEVEN', final_pnl)
                         if ok:
@@ -520,20 +560,18 @@ def tp_monitor():
                                 f"Sembol: <b>{sym_short}</b>\n"
                                 f"Yön: {'LONG' if side=='buy' else 'SHORT'}\n"
                                 f"Fiyat: ${cur_price:.4f}\n"
-                                f"Entry: ${avg_price:.4f}\n"
+                                f"ROI: %{real_pnl_pct:.2f}\n"
                                 f"Toplam PnL: +${final_pnl:.2f} (TP1 kârı korundu)"
                             )
                         else:
                             send_telegram(f"⚠️ {sym_short} SL'de kapandı ama panel kaydı başarısız oldu, kontrol edin!")
                         continue
 
-                    # --- TP2: kalan pozisyonun TAMAMI kapanır ---
+                    # --- TP2: kalan pozisyonun TAMAMI kapanır (ROI hedefi ile) ---
                     if hit_tp2 and not tp2_done:
-                        qty = total_contracts  # kalan = TP2 payının tamamı, yüzde uygulanmaz
-                        okx.create_market_order(
-                            symbol=symbol, side=close_side, amount=qty,
-                            params={"posSide": pos_side, "reduceOnly": True}
-                        )
+                        ok_order, sent_qty = safe_close_order(okx, symbol, close_side, pos_side, total_contracts)
+                        if not ok_order:
+                            continue
                         sym_short = symbol.replace('/USDT:USDT', '')
                         total_realized = (realized_pnl or 0) + pnl_usd
                         ok = close_full_position_in_db(symbol, side, 'TP2', total_realized)
@@ -543,6 +581,7 @@ def tp_monitor():
                                 f"Sembol: <b>{sym_short}</b>\n"
                                 f"Yön: {'LONG' if side=='buy' else 'SHORT'}\n"
                                 f"Fiyat: ${cur_price:.4f}\n"
+                                f"ROI: %{real_pnl_pct:.2f} (hedef: %{tp2_pct_roi})\n"
                                 f"Toplam PnL: +${total_realized:.2f} USDT"
                             )
                         else:
@@ -551,23 +590,27 @@ def tp_monitor():
 
                     # --- TP1: kısmi kapama + breakeven SL aktif et + gerçekleşen kârı biriktir ---
                     elif hit_tp1 and not tp1_done:
-                        qty = math.floor(total_contracts * tp1_qty * 10) / 10
-                        if qty <= 0 or qty >= total_contracts:
-                            qty = total_contracts * 0.5
-                            qty = math.floor(qty * 10) / 10
-                        if qty <= 0:
-                            qty = total_contracts
+                        raw_qty = math.floor(total_contracts * tp1_qty * 10) / 10
+                        if raw_qty <= 0 or raw_qty >= total_contracts:
+                            raw_qty = total_contracts * 0.5
+                        if raw_qty <= 0:
+                            raw_qty = total_contracts
 
-                        # TP1'de kapanan dilimin gerçekleşen kârını oransal hesapla
-                        portion      = qty / total_contracts if total_contracts else 0
+                        ok_order, sent_qty = safe_close_order(okx, symbol, close_side, pos_side, raw_qty)
+                        if not ok_order:
+                            continue
+                        if sent_qty <= 0:
+                            # Hesaplanan TP1 dilimi borsa min eşiğinin altında kaldıysa, TP1'i atla,
+                            # doğrudan TP2 hedefine kadar beklensin (pozisyonu bölmeye çalışmak anlamsız).
+                            print(f"ℹ️ {symbol}: TP1 dilimi min eşiğin altında, TP1 atlanıyor, TP2 bekleniyor")
+                            continue
+
+                        # Gerçekte kapanan oran üzerinden gerçekleşen kârı hesapla
+                        portion      = sent_qty / total_contracts if total_contracts else 0
                         tp1_realized = pnl_usd * portion
 
-                        okx.create_market_order(
-                            symbol=symbol, side=close_side, amount=qty,
-                            params={"posSide": pos_side, "reduceOnly": True}
-                        )
                         sym_short = symbol.replace('/USDT:USDT', '')
-                        remaining = max(0, round(total_contracts - qty, 6))
+                        remaining = max(0, round(total_contracts - sent_qty, 8))
                         ok = update_partial_position_in_db(
                             symbol, tp1_done=1, sl_active=1,
                             total_contracts=remaining, realized_pnl=tp1_realized
@@ -578,9 +621,10 @@ def tp_monitor():
                                 f"Sembol: <b>{sym_short}</b>\n"
                                 f"Yön: {'LONG' if side=='buy' else 'SHORT'}\n"
                                 f"Fiyat: ${cur_price:.4f}\n"
+                                f"ROI: %{real_pnl_pct:.2f} (hedef: %{tp1_pct_roi})\n"
                                 f"Gerçekleşen kâr: +${tp1_realized:.2f} USDT\n"
                                 f"Kalan pozisyon TP2'de tamamen kapanacak\n"
-                                f"🛡 SL Breakeven aktif @ ${avg_price:.4f}"
+                                f"🛡 SL Breakeven aktif"
                             )
                         else:
                             send_telegram(f"⚠️ {sym_short} TP1'de kapandı ama panel kaydı başarısız oldu, kontrol edin!")
@@ -617,7 +661,6 @@ def dashboard_data():
         okx = okx_pos.get(symbol, {})
 
         if not okx:
-            # Borsada karşılığı yok -> manuel kapatılmış ama DB'den silinememiş demektir.
             stale_symbols.append((symbol, side, bool(tp1_done)))
             continue
 
@@ -643,8 +686,6 @@ def dashboard_data():
             "slPrice":   real_entry,
         })
 
-    # Borsada artık olmayan ama DB'de kalmış pozisyonları burada da temizle
-    # (panel her açıldığında ekstra bir güvenlik katmanı, tp_monitor'u 10sn beklemeden)
     if stale_symbols:
         conn3 = get_db()
         cur3  = conn3.cursor()
@@ -656,6 +697,9 @@ def dashboard_data():
             print(f"ℹ️ Panel: {sym} borsada yok, DB temizleniyor ({status})")
             close_full_position_in_db(sym, sd, status, fallback_pnl)
         conn3.close()
+
+    tp1_pct_roi = float(get_setting('tp1_pct', 1.5))
+    tp2_pct_roi = float(get_setting('tp2_pct', 3.0))
 
     return jsonify({
         "total":        total,
@@ -669,6 +713,8 @@ def dashboard_data():
         "sl":           sl,
         "tp2_bekliyor": tp2_bekliyor,
         "positions":    positions,
+        "tp1_roi":      tp1_pct_roi,
+        "tp2_roi":      tp2_pct_roi,
         "today":        datetime.now().strftime('%d %b %Y'),
     })
 
@@ -925,10 +971,10 @@ input:focus{outline:none;border-color:#4caf50}
   <h2>⚙️ Filtreler & Kar Al</h2>
   <label>Min. Fibo Mesafesi (%) — İlk girişte kontrol edilir</label>
   <input type="number" step="0.1" name="min_dist" value="{{ min_dist }}">
-  <label>TP1 Oranı (%)</label><input type="number" step="0.1" name="tp1_pct" value="{{ tp1_pct }}">
+  <label>TP1 ROI % (kaldıraçlı — OKX PnL% ile birebir)</label><input type="number" step="0.1" name="tp1_pct" value="{{ tp1_pct }}">
   <label>TP1 Satış (%) — kalanın tamamı TP2'de kapanır</label><input type="number" name="tp1_qty" value="{{ tp1_qty }}">
-  <label>TP2 Oranı (%)</label><input type="number" step="0.1" name="tp2_pct" value="{{ tp2_pct }}">
-  <div class="note">ℹ️ TP2 tetiklendiğinde kalan pozisyonun tamamı kapanır. TP1 sonrası gelen breakeven SL de artık TP1'de gerçekleşen kârı koruyarak WIN olarak sayılır.</div>
+  <label>TP2 ROI % (kaldıraçlı — OKX PnL% ile birebir)</label><input type="number" step="0.1" name="tp2_pct" value="{{ tp2_pct }}">
+  <div class="note">ℹ️ TP1/TP2 yüzdeleri artık OKX'in gösterdiği kaldıraçlı PnL% (ROI) ile birebir aynı — yazdığın değer ne ise pozisyon tam o ROI'de kapanır. TP2 tetiklendiğinde kalan pozisyonun tamamı kapanır. TP1 sonrası gelen breakeven SL, TP1'de gerçekleşen kârı koruyarak WIN olarak sayılır.</div>
 </div>
 <div class="card">
   <h2>📱 Telegram Bildirimleri</h2>
@@ -949,7 +995,7 @@ function fmt(n, d=2){
   return (n >= 0 ? '+' : '') + n.toFixed(d);
 }
 
-function renderPositions(positions){
+function renderPositions(positions, tp1Roi, tp2Roi){
   const container = document.getElementById('positions');
   if(!positions.length){
     container.innerHTML = '<div class="no-pos">Aktif pozisyon yok</div>';
@@ -959,19 +1005,12 @@ function renderPositions(positions){
   positions.forEach(p => {
     const isPos  = p.pnlUsd >= 0;
     const cls    = isPos ? 'pos-val' : 'neg-val';
-    const barW   = Math.min(Math.abs(p.pnlPct) * 5, 100);
+    const barW   = Math.min(Math.abs(p.pnlPct) / Math.max(tp2Roi,1) * 100, 100);
     const barClr = isPos ? '#4caf50' : '#ff5252';
     const sym    = p.symbol.replace('/USDT:USDT','');
 
-    const tp1_pct  = p.side === 'buy' ? 1.015 : 0.985;
-    const tp2_pct  = p.side === 'buy' ? 1.030 : 0.970;
-    const tp1Price = (p.avgPrice * tp1_pct).toFixed(4);
-    const tp2Price = (p.avgPrice * tp2_pct).toFixed(4);
-
-    const tp1Target = p.side === 'buy' ? p.avgPrice * 1.015 : p.avgPrice * 0.985;
-    const distToTp1 = p.side === 'buy'
-      ? (tp1Target - p.markPrice) / p.markPrice * 100
-      : (p.markPrice - tp1Target) / p.markPrice * 100;
+    // ROI bazlı kalan mesafe (kaldıraçlı PnL% üzerinden, artık fiyat değil)
+    const distToTp1 = tp1Roi - p.pnlPct;
 
     html += `
     <div class="pos-card">
@@ -988,13 +1027,13 @@ function renderPositions(positions){
         <div class="cell"><div class="clabel">Mark Fiyat</div><div class="cval ${cls}">$${p.markPrice.toFixed(4)}</div></div>
         <div class="cell"><div class="clabel">Pozisyon ($)</div><div class="cval">$${p.sizeUsd.toFixed(2)}</div></div>
         <div class="cell"><div class="clabel">PnL (USDT)</div><div class="cval ${cls}">${fmtU(p.pnlUsd)}</div></div>
-        <div class="cell"><div class="clabel">PnL (%)</div><div class="cval ${cls}">${fmt(p.pnlPct)}%</div></div>
-        <div class="cell"><div class="clabel">TP1'e Uzaklık</div><div class="cval neu-val">${fmt(distToTp1,2)}%</div></div>
+        <div class="cell"><div class="clabel">ROI %</div><div class="cval ${cls}">${fmt(p.pnlPct)}%</div></div>
+        <div class="cell"><div class="clabel">TP1'e Uzaklık (ROI)</div><div class="cval neu-val">${fmt(distToTp1,2)}%</div></div>
       </div>
       <div class="pnl-bar-wrap">
         <div class="pnl-bar-label">
-          <span>SL $${p.slPrice.toFixed(4)}</span>
-          <span>TP1 $${tp1Price} | TP2 $${tp2Price}</span>
+          <span>SL Breakeven</span>
+          <span>TP1 %${tp1Roi} | TP2 %${tp2Roi}</span>
         </div>
         <div class="pnl-bar-bg"><div class="pnl-bar-fill" style="width:${barW}%;background:${barClr}"></div></div>
       </div>
@@ -1177,7 +1216,7 @@ async function refreshAll(){
     document.getElementById('d-sl').textContent       = d.sl;
     document.getElementById('d-tp2bek').textContent   = d.tp2_bekliyor;
 
-    renderPositions(d.positions);
+    renderPositions(d.positions, d.tp1_roi, d.tp2_roi);
 
     document.getElementById('last-update').textContent =
       'Güncellendi: ' + new Date().toLocaleTimeString('tr-TR');
@@ -1283,8 +1322,6 @@ def close_position():
 
         # OKX'te zaten kapalıysa (kullanıcı borsadan elle kapatmış olabilir) -> sadece DB'yi temizle
         if cur_price is None:
-            ticker    = okx.fetch_ticker(symbol)
-            cur_price = ticker['last']
             fallback_pnl = realized_pnl or 0.0
             status = 'SL_BREAKEVEN' if tp1_done else 'MANUEL_SENKRON'
             ok = close_full_position_in_db(symbol, side, status, fallback_pnl)
@@ -1293,21 +1330,19 @@ def close_position():
             else:
                 return jsonify({"status": "error", "message": "Borsada pozisyon yok ama panel güncellenemedi (DB hatası), tekrar deneyin"}), 200
 
-        okx.create_market_order(
-            symbol=symbol, side=close_side, amount=total_contracts,
-            params={"posSide": pos_side, "reduceOnly": True}
-        )
+        ok_order, sent_qty = safe_close_order(okx, symbol, close_side, pos_side, total_contracts)
+        if not ok_order:
+            return jsonify({"status": "error", "message": "Borsa emri başarısız oldu, tekrar deneyin"}), 200
+
         sym_short = symbol.replace('/USDT:USDT', '')
 
-        # TP1 sonrası gelen manuel kapamada da biriken kâr dahil edilir, win/lose doğru hesaplanır
         total_realized = (realized_pnl or 0) + real_pnl_usd
         status = 'SL_BREAKEVEN' if tp1_done else 'MANUEL'
         if tp1_done and total_realized <= 0:
-            total_realized = 0.01  # TP1 kârı gerçekleşmiş, win sayılmalı
+            total_realized = 0.01
 
         ok = close_full_position_in_db(symbol, side, status, total_realized)
         if not ok:
-            # OKX'te kapandı ama DB güncellenemedi -> kullanıcıyı net şekilde uyar, sessiz kalma
             return jsonify({
                 "status": "error",
                 "message": f"{sym_short} borsada kapatıldı (PnL: ${total_realized:.2f}) AMA panel güncellenemedi! Sayfayı yenileyip tekrar dener misin?"
@@ -1407,16 +1442,17 @@ def webhook():
             conn.close()
             return jsonify({"status": "ignored", "message": f"Step {step} zaten işlendi"}), 200
         if step > 1:
+            # DCA için fiyat ortalamayı doğru yönde hareket ettirmeli (LONG'da düşmeli, SHORT'ta yükselmeli)
             if side == 'buy' and current_price >= last_entry_price:
                 conn.close()
-                return jsonify({"status": "ignored", "message": "LONG DCA engeli"}), 200
+                return jsonify({"status": "ignored", "message": "LONG DCA engeli: fiyat son girişin altında değil"}), 200
             if side == 'sell' and current_price <= last_entry_price:
                 conn.close()
-                return jsonify({"status": "ignored", "message": "SHORT DCA engeli"}), 200
+                return jsonify({"status": "ignored", "message": "SHORT DCA engeli: fiyat son girişin üstünde değil"}), 200
             price_diff_pct = abs(current_price - last_entry_price) / last_entry_price * 100
             if price_diff_pct < min_distance_filter:
                 conn.close()
-                return jsonify({"status": "ignored", "message": "Mesafe engeli"}), 200
+                return jsonify({"status": "ignored", "message": f"Mesafe engeli: son girişe %{price_diff_pct:.3f} uzaklık, min %{min_distance_filter} gerekli"}), 200
 
     try:
         try:
@@ -1436,12 +1472,7 @@ def webhook():
         min_qty        = market['limits']['amount']['min']
         if calculated_qty < min_qty:
             calculated_qty = min_qty
-        precision = market['precision']['amount']
-        if precision and precision > 0:
-            d         = int(round(-math.log10(precision)))
-            final_qty = math.floor(calculated_qty * (10**d)) / (10**d)
-        else:
-            final_qty = math.floor(calculated_qty)
+        final_qty = round_amount_to_precision(okx, symbol, calculated_qty)
         if final_qty <= 0:
             final_qty = min_qty if min_qty else 1
 
