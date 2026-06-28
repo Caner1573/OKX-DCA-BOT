@@ -84,6 +84,7 @@ def init_db():
         ('tp2_done',        'INTEGER DEFAULT 0'),
         ('sl_active',       'INTEGER DEFAULT 0'),
         ('realized_pnl',    'REAL DEFAULT 0'),
+        ('sl_target_roi',   'REAL DEFAULT 0'),
     ]:
         if col not in existing:
             cursor.execute(f"ALTER TABLE active_positions ADD COLUMN {col} {definition}")
@@ -116,7 +117,7 @@ def get_stats():
     conn = get_db()
     cursor = conn.cursor()
     try:
-        cursor.execute("SELECT COUNT(*), SUM(CASE WHEN pnl > 0 THEN 1 ELSE 0 END), SUM(pnl) FROM trades")
+        cursor.execute("SELECT COUNT(*), SUM(CASE WHEN pnl > 0 THEN 1 ELSE 0 END), SUM(pnl) FROM trades WHERE status != 'MANUEL_SENKRON'")
         row       = cursor.fetchone()
         total     = row[0] if row[0] else 0
         wins      = row[1] if row[1] else 0
@@ -133,7 +134,7 @@ def get_daily_stats():
     cursor = conn.cursor()
     today = datetime.now().strftime('%Y-%m-%d')
     try:
-        cursor.execute("SELECT COUNT(*) FROM trades WHERE closed_at LIKE ?", (today + '%',))
+        cursor.execute("SELECT COUNT(*) FROM trades WHERE closed_at LIKE ? AND status != 'MANUEL_SENKRON'", (today + '%',))
         kapanan = cursor.fetchone()[0] or 0
         cursor.execute("SELECT COUNT(*) FROM trades WHERE status='TP1' AND closed_at LIKE ?", (today + '%',))
         tp1 = cursor.fetchone()[0] or 0
@@ -157,6 +158,8 @@ def get_pnl_analytics(range_key):
     trades tablosundan range_key'e göre gruplanmış PnL analitiği döndürür.
     24h -> saatlik noktalar (son 24 saat)
     diğerleri -> günlük satırlar (tarih, işlem sayısı, kazanan, kaybeden, pnl, kümülatif)
+    MANUEL_SENKRON kayıtları (gerçek sonucu bilinmeyen, elle/OKX'ten kapatılmış pozisyonlar)
+    istatistiklere hiç dahil edilmez.
     """
     conn = get_db()
     cursor = conn.cursor()
@@ -175,7 +178,7 @@ def get_pnl_analytics(range_key):
                        COUNT(*), SUM(CASE WHEN pnl > 0 THEN 1 ELSE 0 END),
                        SUM(CASE WHEN pnl <= 0 THEN 1 ELSE 0 END), SUM(pnl)
                 FROM trades
-                WHERE closed_at >= ?
+                WHERE closed_at >= ? AND status != 'MANUEL_SENKRON'
                 GROUP BY bucket
                 ORDER BY bucket ASC
             """, (since,))
@@ -205,7 +208,7 @@ def get_pnl_analytics(range_key):
                            COUNT(*), SUM(CASE WHEN pnl > 0 THEN 1 ELSE 0 END),
                            SUM(CASE WHEN pnl <= 0 THEN 1 ELSE 0 END), SUM(pnl)
                     FROM trades
-                    WHERE closed_at >= ?
+                    WHERE closed_at >= ? AND status != 'MANUEL_SENKRON'
                     GROUP BY d
                     ORDER BY d ASC
                 """, (since,))
@@ -215,7 +218,7 @@ def get_pnl_analytics(range_key):
                            COUNT(*), SUM(CASE WHEN pnl > 0 THEN 1 ELSE 0 END),
                            SUM(CASE WHEN pnl <= 0 THEN 1 ELSE 0 END), SUM(pnl)
                     FROM trades
-                    WHERE closed_at IS NOT NULL
+                    WHERE closed_at IS NOT NULL AND status != 'MANUEL_SENKRON'
                     GROUP BY d
                     ORDER BY d ASC
                 """)
@@ -307,11 +310,10 @@ def round_amount_to_precision(okx, symbol, amount):
         return rounded
     except Exception as e:
         print(f"⚠️ Precision yuvarlama hatası {symbol}: {e}")
-        return amount  # son çare: yuvarlamadan dön, en azından emir denensin
+        return amount
 
 def get_okx_positions():
-    """OKX'ten TÜM açık pozisyonları TEK seferde çeker, sembol -> veri sözlüğü döner.
-    Bu, çok sayıda pozisyon varken sembol-sembol API çağırmaktan (rate-limit riski) kaçınır."""
+    """OKX'ten TÜM açık pozisyonları TEK seferde çeker, sembol -> veri sözlüğü döner."""
     try:
         okx = get_okx()
         if not okx:
@@ -456,8 +458,7 @@ def update_partial_position_in_db(symbol, **fields):
 def safe_close_order(okx, symbol, close_side, pos_side, amount):
     """
     reduceOnly market emri gönderir, ama önce miktarı precision'a yuvarlar.
-    Yuvarlanan miktar 0 ise (borsanın min eşiğinin altında kaldıysa) emir GÖNDERMEZ,
-    sadece bunu (True, 0) olarak işaretler ki çağıran taraf pozisyonu DB'den temizleyebilsin.
+    Yuvarlanan miktar 0 ise (borsanın min eşiğinin altında kaldıysa) emir GÖNDERMEZ.
     Dönen: (basarili: bool, gonderilen_miktar: float)
     """
     rounded = round_amount_to_precision(okx, symbol, amount)
@@ -480,35 +481,36 @@ def tp_monitor():
         try:
             conn   = get_db()
             cursor = conn.cursor()
-            cursor.execute("SELECT symbol, side, avg_entry_price, total_contracts, tp1_done, tp2_done, sl_active, realized_pnl FROM active_positions")
+            cursor.execute("SELECT symbol, side, avg_entry_price, total_contracts, tp1_done, tp2_done, sl_active, realized_pnl, sl_target_roi FROM active_positions")
             positions = cursor.fetchall()
             conn.close()
 
             if not positions:
-                time.sleep(10)
+                time.sleep(4)
                 continue
 
             okx = get_okx()
             if not okx:
-                time.sleep(10)
+                time.sleep(4)
                 continue
 
             try:
                 okx.load_markets()
             except Exception as e:
                 print(f"⚠️ Market yüklenemedi (tp_monitor): {e}")
-                time.sleep(10)
+                time.sleep(4)
                 continue
 
             # TEK seferde tüm pozisyonları çek (rate-limit güvenli, sembol sayısından bağımsız hızlı)
             okx_positions_map = get_okx_positions()
 
-            tp1_pct_roi = float(get_setting('tp1_pct', 1.5))   # artık KALDIRAÇLI ROI yüzdesi
-            tp2_pct_roi = float(get_setting('tp2_pct', 3.0))
-            tp1_qty     = float(get_setting('tp1_qty', 50)) / 100
+            tp1_pct_roi  = float(get_setting('tp1_pct', 1.5))   # KALDIRAÇLI ROI yüzdesi
+            tp2_pct_roi  = float(get_setting('tp2_pct', 3.0))
+            tp1_qty      = float(get_setting('tp1_qty', 50)) / 100
+            sl_guard_pct = float(get_setting('sl_guard_pct', 30)) / 100  # TP1 ROI'sinin korunacak oranı
 
             for pos in positions:
-                symbol, side, avg_price, total_contracts, tp1_done, tp2_done, sl_active, realized_pnl = pos
+                symbol, side, avg_price, total_contracts, tp1_done, tp2_done, sl_active, realized_pnl, sl_target_roi = pos
                 if not avg_price or avg_price == 0:
                     continue
                 if not total_contracts or total_contracts == 0:
@@ -518,8 +520,6 @@ def tp_monitor():
                     okx_pos = okx_positions_map.get(symbol)
 
                     if not okx_pos:
-                        # Borsada pozisyon yok ama DB'de hâlâ "açık" görünüyor demek ki manuel/başka yoldan
-                        # kapanmış ve DB güncellenememiş. DB'yi senkronize et, sessizce kayıp PnL bırakma.
                         print(f"ℹ️ {symbol} borsada bulunamadı, DB'den temizleniyor (muhtemelen manuel kapatılmış)")
                         fallback_pnl = realized_pnl or 0.0
                         status = 'SL_BREAKEVEN' if tp1_done else 'MANUEL_SENKRON'
@@ -533,41 +533,44 @@ def tp_monitor():
                     if not cur_price:
                         continue
 
-                    # --- ROI BAZLI TP/SL: artık fiyat farkı değil, OKX'in kaldıraçlı ROI%'si kullanılır ---
+                    # --- ROI BAZLI TP/SL ---
                     hit_tp1 = real_pnl_pct >= tp1_pct_roi
                     hit_tp2 = real_pnl_pct >= tp2_pct_roi
-                    # Breakeven SL: TP1 sonrası, fiyat giriş ortalamasına geri dönerse (ROI ~0 veya altı)
-                    hit_sl  = bool(sl_active) and (real_pnl_pct <= 0)
+
+                    # SL artık tam breakeven (ROI 0) değil — TP1 ROI'sinin sl_guard_pct kadarını koruyor.
+                    # sl_target_roi, TP1 anında hesaplanıp DB'ye yazılıyor (örn TP1=%11, guard=%30 ise hedef=%3.3)
+                    sl_threshold = sl_target_roi if sl_target_roi else 0
+                    hit_sl  = bool(sl_active) and (real_pnl_pct <= sl_threshold)
 
                     close_side  = 'sell' if side == 'buy' else 'buy'
                     pos_side    = 'long' if side == 'buy' else 'short'
                     pnl_usd     = real_pnl_usd
 
-                    print(f"👁 {symbol} | Fiyat:{cur_price} | Ort:{avg_price:.6f} | ROI:%{real_pnl_pct:.2f} | PnL:{pnl_usd:.2f} | SL_Aktif:{bool(sl_active)} | Birikmiş:{realized_pnl or 0:.2f}")
+                    print(f"👁 {symbol} | Fiyat:{cur_price} | Ort:{avg_price:.6f} | ROI:%{real_pnl_pct:.2f} | PnL:{pnl_usd:.2f} | SL_Aktif:{bool(sl_active)} (eşik:%{sl_threshold:.2f}) | Birikmiş:{realized_pnl or 0:.2f}")
 
-                    # --- SL (BREAKEVEN): TP1 sonrası geldiği için her zaman WIN sayılır ---
+                    # --- SL (Kısmi Kâr Korumalı): TP1 sonrası geldiği için her zaman WIN sayılır ---
                     if hit_sl and not tp2_done:
                         ok_order, sent_qty = safe_close_order(okx, symbol, close_side, pos_side, total_contracts)
                         if not ok_order:
-                            continue  # emir başarısız oldu, bir sonraki turda tekrar denenecek
+                            continue
                         sym_short = symbol.replace('/USDT:USDT', '')
                         total_realized = (realized_pnl or 0) + pnl_usd
                         final_pnl = total_realized if total_realized > 0 else 0.01
                         ok = close_full_position_in_db(symbol, side, 'SL_BREAKEVEN', final_pnl)
                         if ok:
                             send_telegram(
-                                f"🛡 <b>SL (Breakeven) Tetiklendi!</b>\n"
+                                f"🛡 <b>SL (Kâr Korumalı) Tetiklendi!</b>\n"
                                 f"Sembol: <b>{sym_short}</b>\n"
                                 f"Yön: {'LONG' if side=='buy' else 'SHORT'}\n"
                                 f"Fiyat: ${cur_price:.4f}\n"
-                                f"ROI: %{real_pnl_pct:.2f}\n"
-                                f"Toplam PnL: +${final_pnl:.2f} (TP1 kârı korundu)"
+                                f"ROI: %{real_pnl_pct:.2f} (koruma eşiği: %{sl_threshold:.2f})\n"
+                                f"Toplam PnL: +${final_pnl:.2f} (TP1 kârının bir kısmı korundu)"
                             )
                         else:
                             send_telegram(f"⚠️ {sym_short} SL'de kapandı ama panel kaydı başarısız oldu, kontrol edin!")
                         continue
 
-                    # --- TP2: kalan pozisyonun TAMAMI kapanır (ROI hedefi ile) ---
+                    # --- TP2: kalan pozisyonun TAMAMI kapanır ---
                     if hit_tp2 and not tp2_done:
                         ok_order, sent_qty = safe_close_order(okx, symbol, close_side, pos_side, total_contracts)
                         if not ok_order:
@@ -588,7 +591,7 @@ def tp_monitor():
                             send_telegram(f"⚠️ {sym_short} TP2'de kapandı ama panel kaydı başarısız oldu, kontrol edin!")
                         continue
 
-                    # --- TP1: kısmi kapama + breakeven SL aktif et + gerçekleşen kârı biriktir ---
+                    # --- TP1: kısmi kapama + kısmi-kâr-korumalı SL aktif et ---
                     elif hit_tp1 and not tp1_done:
                         raw_qty = math.floor(total_contracts * tp1_qty * 10) / 10
                         if raw_qty <= 0 or raw_qty >= total_contracts:
@@ -600,20 +603,21 @@ def tp_monitor():
                         if not ok_order:
                             continue
                         if sent_qty <= 0:
-                            # Hesaplanan TP1 dilimi borsa min eşiğinin altında kaldıysa, TP1'i atla,
-                            # doğrudan TP2 hedefine kadar beklensin (pozisyonu bölmeye çalışmak anlamsız).
                             print(f"ℹ️ {symbol}: TP1 dilimi min eşiğin altında, TP1 atlanıyor, TP2 bekleniyor")
                             continue
 
-                        # Gerçekte kapanan oran üzerinden gerçekleşen kârı hesapla
                         portion      = sent_qty / total_contracts if total_contracts else 0
                         tp1_realized = pnl_usd * portion
+
+                        # Yeni SL hedefi: TP1 ROI'sinin sl_guard_pct kadarı (örn %11 * %30 = %3.3)
+                        new_sl_target = real_pnl_pct * sl_guard_pct
 
                         sym_short = symbol.replace('/USDT:USDT', '')
                         remaining = max(0, round(total_contracts - sent_qty, 8))
                         ok = update_partial_position_in_db(
                             symbol, tp1_done=1, sl_active=1,
-                            total_contracts=remaining, realized_pnl=tp1_realized
+                            total_contracts=remaining, realized_pnl=tp1_realized,
+                            sl_target_roi=new_sl_target
                         )
                         if ok:
                             send_telegram(
@@ -624,7 +628,7 @@ def tp_monitor():
                                 f"ROI: %{real_pnl_pct:.2f} (hedef: %{tp1_pct_roi})\n"
                                 f"Gerçekleşen kâr: +${tp1_realized:.2f} USDT\n"
                                 f"Kalan pozisyon TP2'de tamamen kapanacak\n"
-                                f"🛡 SL Breakeven aktif"
+                                f"🛡 SL artık %{new_sl_target:.2f} ROI'de korumaya alındı (tam breakeven değil)"
                             )
                         else:
                             send_telegram(f"⚠️ {sym_short} TP1'de kapandı ama panel kaydı başarısız oldu, kontrol edin!")
@@ -635,7 +639,7 @@ def tp_monitor():
         except Exception as e:
             print(f"⚠️ TP monitor hatası: {e}")
 
-        time.sleep(10)
+        time.sleep(4)
 
 threading.Thread(target=tp_monitor,          daemon=True).start()
 threading.Thread(target=self_ping,           daemon=True).start()
@@ -648,7 +652,7 @@ def dashboard_data():
 
     conn = get_db()
     cursor = conn.cursor()
-    cursor.execute("SELECT symbol, side, avg_entry_price, total_contracts, current_step, tp1_done, tp2_done, sl_active FROM active_positions")
+    cursor.execute("SELECT symbol, side, avg_entry_price, total_contracts, current_step, tp1_done, tp2_done, sl_active, sl_target_roi FROM active_positions")
     active_pos = cursor.fetchall()
     conn.close()
 
@@ -657,7 +661,7 @@ def dashboard_data():
     positions = []
     stale_symbols = []
     for p in active_pos:
-        symbol, side, avg_price, contracts, step, tp1_done, tp2_done, sl_active = p
+        symbol, side, avg_price, contracts, step, tp1_done, tp2_done, sl_active, sl_target_roi = p
         okx = okx_pos.get(symbol, {})
 
         if not okx:
@@ -671,19 +675,19 @@ def dashboard_data():
         real_size    = okx.get('sizeUsd',     0.0)
 
         positions.append({
-            "symbol":    symbol,
-            "side":      side,
-            "avgPrice":  real_entry,
-            "markPrice": real_mark,
-            "pnlUsd":    real_pnl_usd,
-            "pnlPct":    real_pnl_pct,
-            "sizeUsd":   real_size,
-            "contracts": contracts,
-            "step":      step,
-            "tp1Done":   bool(tp1_done),
-            "tp2Done":   bool(tp2_done),
-            "slActive":  bool(sl_active),
-            "slPrice":   real_entry,
+            "symbol":      symbol,
+            "side":        side,
+            "avgPrice":    real_entry,
+            "markPrice":   real_mark,
+            "pnlUsd":      real_pnl_usd,
+            "pnlPct":      real_pnl_pct,
+            "sizeUsd":     real_size,
+            "contracts":   contracts,
+            "step":        step,
+            "tp1Done":     bool(tp1_done),
+            "tp2Done":     bool(tp2_done),
+            "slActive":    bool(sl_active),
+            "slTargetRoi": sl_target_roi or 0,
         })
 
     if stale_symbols:
@@ -698,8 +702,9 @@ def dashboard_data():
             close_full_position_in_db(sym, sd, status, fallback_pnl)
         conn3.close()
 
-    tp1_pct_roi = float(get_setting('tp1_pct', 1.5))
-    tp2_pct_roi = float(get_setting('tp2_pct', 3.0))
+    tp1_pct_roi  = float(get_setting('tp1_pct', 1.5))
+    tp2_pct_roi  = float(get_setting('tp2_pct', 3.0))
+    sl_guard_pct = float(get_setting('sl_guard_pct', 30))
 
     return jsonify({
         "total":        total,
@@ -715,6 +720,7 @@ def dashboard_data():
         "positions":    positions,
         "tp1_roi":      tp1_pct_roi,
         "tp2_roi":      tp2_pct_roi,
+        "sl_guard_pct": sl_guard_pct,
         "today":        datetime.now().strftime('%d %b %Y'),
     })
 
@@ -744,6 +750,7 @@ def dashboard():
         'tp1_pct':    get_setting('tp1_pct',  '1.5'),
         'tp1_qty':    get_setting('tp1_qty',  '50'),
         'tp2_pct':    get_setting('tp2_pct',  '3.0'),
+        'sl_guard_pct': get_setting('sl_guard_pct', '30'),
         'tg_token':   get_setting('tg_token', ''),
         'tg_chat_id': get_setting('tg_chat_id', ''),
     }
@@ -884,7 +891,7 @@ input:focus{outline:none;border-color:#4caf50}
   </div>
   <div class="daily-row"><span class="daily-label">TP1 oldu</span><span class="daily-val" style="color:#4caf50" id="d-tp1">-</span></div>
   <div class="daily-row"><span class="daily-label">TP2 oldu</span><span class="daily-val" style="color:#42a5f5" id="d-tp2">-</span></div>
-  <div class="daily-row"><span class="daily-label">TP1 → SL yedi</span><span class="daily-val" style="color:#ffa726" id="d-sl">-</span></div>
+  <div class="daily-row"><span class="daily-label">TP1 → SL yedi (kâr korumalı)</span><span class="daily-val" style="color:#ffa726" id="d-sl">-</span></div>
   <div class="daily-row"><span class="daily-label">TP2 bekliyor</span><span class="daily-val" style="color:#888" id="d-tp2bek">-</span></div>
 </div>
 
@@ -947,7 +954,7 @@ input:focus{outline:none;border-color:#4caf50}
     <tbody id="paTblBody"><tr><td colspan="6" class="no-pos">Yükleniyor...</td></tr></tbody>
   </table>
   </div>
-  <div class="footnote" id="pa-footnote">veriler her saat güncellenir</div>
+  <div class="footnote" id="pa-footnote">veriler her saat güncellenir · elle/borsadan kapatılan ve sonucu bilinmeyen pozisyonlar istatistiğe dahil edilmez</div>
 </div>
 
 <div class="card">
@@ -974,7 +981,9 @@ input:focus{outline:none;border-color:#4caf50}
   <label>TP1 ROI % (kaldıraçlı — OKX PnL% ile birebir)</label><input type="number" step="0.1" name="tp1_pct" value="{{ tp1_pct }}">
   <label>TP1 Satış (%) — kalanın tamamı TP2'de kapanır</label><input type="number" name="tp1_qty" value="{{ tp1_qty }}">
   <label>TP2 ROI % (kaldıraçlı — OKX PnL% ile birebir)</label><input type="number" step="0.1" name="tp2_pct" value="{{ tp2_pct }}">
-  <div class="note">ℹ️ TP1/TP2 yüzdeleri artık OKX'in gösterdiği kaldıraçlı PnL% (ROI) ile birebir aynı — yazdığın değer ne ise pozisyon tam o ROI'de kapanır. TP2 tetiklendiğinde kalan pozisyonun tamamı kapanır. TP1 sonrası gelen breakeven SL, TP1'de gerçekleşen kârı koruyarak WIN olarak sayılır.</div>
+  <label>SL Koruma Oranı (%) — TP1 ROI'sinin kaç%'i SL'de korunsun</label>
+  <input type="number" step="1" name="sl_guard_pct" value="{{ sl_guard_pct }}">
+  <div class="note">ℹ️ Örnek: TP1=%11, SL Koruma=%30 → TP1 sonrası SL artık %0 (tam breakeven) değil, %3.3 ROI'de devreye girer. Fiyat geri dönse bile TP1 kârının bir kısmı korunur. %0 girersen eski "tam breakeven" davranışına döner, %100 girersen SL'i TP1 seviyesinde sabitler. TP2 tetiklendiğinde kalan pozisyonun tamamı kapanır.</div>
 </div>
 <div class="card">
   <h2>📱 Telegram Bildirimleri</h2>
@@ -1009,8 +1018,8 @@ function renderPositions(positions, tp1Roi, tp2Roi){
     const barClr = isPos ? '#4caf50' : '#ff5252';
     const sym    = p.symbol.replace('/USDT:USDT','');
 
-    // ROI bazlı kalan mesafe (kaldıraçlı PnL% üzerinden, artık fiyat değil)
     const distToTp1 = tp1Roi - p.pnlPct;
+    const slLabel = p.slActive ? ('%' + p.slTargetRoi.toFixed(2)) : '—';
 
     html += `
     <div class="pos-card">
@@ -1032,7 +1041,7 @@ function renderPositions(positions, tp1Roi, tp2Roi){
       </div>
       <div class="pnl-bar-wrap">
         <div class="pnl-bar-label">
-          <span>SL Breakeven</span>
+          <span>SL eşiği: ${slLabel}</span>
           <span>TP1 %${tp1Roi} | TP2 %${tp2Roi}</span>
         </div>
         <div class="pnl-bar-bg"><div class="pnl-bar-fill" style="width:${barW}%;background:${barClr}"></div></div>
@@ -1228,7 +1237,7 @@ async function refreshAll(){
 
 refreshAll();
 loadPnlAnalytics(document.getElementById('rangeSel').value);
-setInterval(refreshAll, 30000);
+setInterval(refreshAll, 15000);
 setInterval(() => loadPnlAnalytics(document.getElementById('rangeSel').value), 60000);
 
 function closePos(symbol, side){
@@ -1320,7 +1329,6 @@ def close_position():
                 real_pnl_pct = float(p.get('percentage', 0) or 0)
                 break
 
-        # OKX'te zaten kapalıysa (kullanıcı borsadan elle kapatmış olabilir) -> sadece DB'yi temizle
         if cur_price is None:
             fallback_pnl = realized_pnl or 0.0
             status = 'SL_BREAKEVEN' if tp1_done else 'MANUEL_SENKRON'
@@ -1442,7 +1450,6 @@ def webhook():
             conn.close()
             return jsonify({"status": "ignored", "message": f"Step {step} zaten işlendi"}), 200
         if step > 1:
-            # DCA için fiyat ortalamayı doğru yönde hareket ettirmeli (LONG'da düşmeli, SHORT'ta yükselmeli)
             if side == 'buy' and current_price >= last_entry_price:
                 conn.close()
                 return jsonify({"status": "ignored", "message": "LONG DCA engeli: fiyat son girişin altında değil"}), 200
